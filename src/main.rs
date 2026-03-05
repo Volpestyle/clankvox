@@ -1137,6 +1137,7 @@ async fn main() {
     // Audio send pipeline: IPC audio → PCM buffer → 20ms Opus encode → DAVE encrypt → RTP
     let audio_send_state = Arc::new(Mutex::new(None::<AudioSendState>));
     let mut send_interval = time::interval(Duration::from_millis(20));
+    send_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
     send_interval.tick().await; // consume first immediate tick
 
     // Music → PCM channel (feeds into audio_send_state)
