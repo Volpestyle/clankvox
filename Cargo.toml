@@ -1,0 +1,37 @@
+[package]
+name = "clankvox"
+version = "0.2.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full", "rt-multi-thread"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+base64 = "0.22"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+anyhow = "1"
+libc = "0.2"
+
+# Voice WebSocket
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+
+# DAVE E2EE
+davey = "0.1.2"
+
+# Opus codec (standalone, for DAVE pipeline)
+audiopus = "0.3.0-rc.0"
+
+# Transport encryption (RTP payload AEAD)
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+
+# rustls crypto provider (required by tokio-tungstenite's rustls backend)
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
