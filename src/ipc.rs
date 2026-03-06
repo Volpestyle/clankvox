@@ -1,11 +1,13 @@
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 
 use crossbeam_channel as crossbeam;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tracing::{error, info};
+use tokio::sync::mpsc;
+use tracing::{error, info, warn};
 
 static IPC_TX: std::sync::OnceLock<crossbeam::Sender<OutMsg>> = std::sync::OnceLock::new();
+const MAX_STDIN_LINE_BYTES: usize = 1_024 * 1_024;
 
 #[derive(Deserialize, Debug)]
 #[serde(tag = "type")]
@@ -92,6 +94,16 @@ pub fn default_silence_duration() -> u32 {
     700
 }
 
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCode {
+    InvalidRequest,
+    InvalidJson,
+    InputTooLarge,
+    VoiceConnectFailed,
+    VoiceRuntimeError,
+}
+
 #[derive(Serialize, Debug, Clone)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
@@ -160,6 +172,7 @@ pub enum OutMsg {
         reason: String,
     },
     Error {
+        code: ErrorCode,
         message: String,
     },
     BufferDepth {
@@ -187,6 +200,10 @@ fn is_lossy_ipc_msg(msg: &OutMsg) -> bool {
     matches!(msg, OutMsg::UserAudio { .. })
 }
 
+fn is_lossy_inbound_msg(msg: &InMsg) -> bool {
+    matches!(msg, InMsg::Audio { .. })
+}
+
 pub fn send_msg(msg: &OutMsg) {
     if let Some(tx) = IPC_TX.get() {
         if is_lossy_ipc_msg(msg) {
@@ -201,10 +218,25 @@ pub fn send_msg(msg: &OutMsg) {
     }
 }
 
-pub fn send_error(message: &str) {
+pub fn send_error(code: ErrorCode, message: impl Into<String>) {
     send_msg(&OutMsg::Error {
-        message: message.to_string(),
+        code,
+        message: message.into(),
     });
+}
+
+pub fn try_send_error(code: ErrorCode, message: impl Into<String>) {
+    if let Some(tx) = IPC_TX.get() {
+        let msg = OutMsg::Error {
+            code,
+            message: message.into(),
+        };
+        if let Err(err) = tx.try_send(msg) {
+            if !matches!(err, crossbeam::TrySendError::Full(_)) {
+                error!("failed to enqueue non-blocking IPC error: {}", err);
+            }
+        }
+    }
 }
 
 pub fn send_tts_playback_state(status: &str, reason: &str) {
@@ -243,6 +275,100 @@ pub fn send_gateway_voice_state_update(guild_id: u64, channel_id: u64, self_mute
             }
         }),
     });
+}
+
+pub fn spawn_ipc_reader(
+    audio_debug: bool,
+) -> (mpsc::UnboundedReceiver<InMsg>, mpsc::Receiver<InMsg>) {
+    let (control_tx, control_rx) = mpsc::unbounded_channel::<InMsg>();
+    let (audio_tx, audio_rx) = mpsc::channel::<InMsg>(256);
+
+    std::thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut handle = stdin.lock();
+        let mut line_buf = String::new();
+        let mut dropped_audio_messages: u64 = 0;
+
+        loop {
+            line_buf.clear();
+            match handle.read_line(&mut line_buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if n > MAX_STDIN_LINE_BYTES {
+                        if audio_debug {
+                            eprintln!(
+                                "[rust-subprocess] Dropping oversized stdin line ({} bytes)",
+                                n
+                            );
+                        }
+                        try_send_error(
+                            ErrorCode::InputTooLarge,
+                            format!("Dropped oversized stdin line ({} bytes)", n),
+                        );
+                        continue;
+                    }
+
+                    let trimmed = line_buf.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+
+                    let msg = match serde_json::from_str::<InMsg>(trimmed) {
+                        Ok(msg) => msg,
+                        Err(err) => {
+                            if audio_debug {
+                                eprintln!(
+                                    "[rust-subprocess] JSON parse error: {} for line: {}",
+                                    err,
+                                    &trimmed[..trimmed.len().min(200)]
+                                );
+                            }
+                            try_send_error(
+                                ErrorCode::InvalidJson,
+                                format!("Invalid stdin JSON message: {}", err),
+                            );
+                            continue;
+                        }
+                    };
+
+                    if is_lossy_inbound_msg(&msg) {
+                        match audio_tx.try_send(msg) {
+                            Ok(()) => {
+                                if dropped_audio_messages > 0 {
+                                    info!(
+                                        dropped_audio_messages = dropped_audio_messages,
+                                        "clankvox_inbound_audio_backpressure_recovered"
+                                    );
+                                    dropped_audio_messages = 0;
+                                }
+                            }
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                dropped_audio_messages = dropped_audio_messages.saturating_add(1);
+                                if dropped_audio_messages == 1 || dropped_audio_messages % 100 == 0
+                                {
+                                    warn!(
+                                        dropped_audio_messages = dropped_audio_messages,
+                                        "dropping inbound clankvox audio IPC due to backpressure"
+                                    );
+                                }
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => break,
+                        }
+                    } else if control_tx.send(msg).is_err() {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    warn!(error = %err, "stdin reader exiting after read error");
+                    break;
+                }
+            }
+        }
+
+        let _ = control_tx.send(InMsg::Destroy);
+    });
+
+    (control_rx, audio_rx)
 }
 
 pub fn spawn_ipc_writer() -> crossbeam::Sender<OutMsg> {

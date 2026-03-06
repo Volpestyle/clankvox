@@ -8,7 +8,7 @@ mod voice_conn;
 
 use std::collections::{hash_map::Entry, HashMap};
 use std::future;
-use std::io::{self, BufRead};
+use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,8 +34,8 @@ use crate::capture::{
 use crate::dave::DaveManager;
 use crate::ipc::{
     default_sample_rate, default_silence_duration, send_buffer_depth, send_error,
-    send_gateway_voice_state_update, send_msg, send_tts_playback_state, spawn_ipc_writer, InMsg,
-    OutMsg,
+    send_gateway_voice_state_update, send_msg, send_tts_playback_state, spawn_ipc_reader,
+    spawn_ipc_writer, ErrorCode, InMsg, OutMsg,
 };
 use crate::music::{
     drain_music_pcm_queue, is_music_output_drained, start_music_pipeline, MusicEvent, MusicState,
@@ -84,6 +84,19 @@ struct PendingConnection {
     user_id: Option<u64>,
 }
 
+fn parse_user_id_field(user_id: &str, context: &str) -> Option<u64> {
+    match user_id.parse::<u64>() {
+        Ok(uid) => Some(uid),
+        Err(_) => {
+            send_error(
+                ErrorCode::InvalidRequest,
+                format!("{} requires a numeric user_id, got {:?}", context, user_id),
+            );
+            None
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -107,58 +120,10 @@ async fn main() {
 
     spawn_ipc_writer();
 
-    // Spawn stdin reader (blocking, off the tokio runtime)
-    let (ipc_msg_tx, mut ipc_msg_rx) = mpsc::channel::<InMsg>(256);
-    {
-        let audio_debug = std::env::var("AUDIO_DEBUG").is_ok();
-        std::thread::spawn(move || {
-            let stdin = io::stdin();
-            let mut handle = stdin.lock();
-            // Cap line length to 1MB to prevent unbounded allocation on malformed input.
-            const MAX_LINE_BYTES: usize = 1_024 * 1_024;
-            let mut line_buf = String::new();
-            loop {
-                line_buf.clear();
-                match handle.read_line(&mut line_buf) {
-                    Ok(0) => break, // EOF
-                    Ok(n) => {
-                        if n > MAX_LINE_BYTES {
-                            if audio_debug {
-                                eprintln!(
-                                    "[rust-subprocess] Dropping oversized stdin line ({} bytes)",
-                                    n
-                                );
-                            }
-                            continue;
-                        }
-                        let trimmed = line_buf.trim();
-                        if trimmed.is_empty() {
-                            continue;
-                        }
-                        match serde_json::from_str::<InMsg>(trimmed) {
-                            Ok(msg) => {
-                                if ipc_msg_tx.blocking_send(msg).is_err() {
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                if audio_debug {
-                                    eprintln!(
-                                        "[rust-subprocess] JSON parse error: {} for line: {}",
-                                        e,
-                                        &trimmed[..trimmed.len().min(200)]
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-            // Stdin closed (pipe broken, likely parent died)
-            let _ = ipc_msg_tx.blocking_send(InMsg::Destroy);
-        });
-    }
+    // Spawn stdin reader with separate control/audio lanes so backpressure on the
+    // main loop or stdout path does not wedge the parent's stdin pipe.
+    let audio_debug = std::env::var("AUDIO_DEBUG").is_ok();
+    let (mut ipc_control_rx, mut ipc_audio_rx) = spawn_ipc_reader(audio_debug);
 
     info!("Voice subprocess started, waiting for IPC messages");
 
@@ -209,16 +174,38 @@ async fn main() {
     loop {
         tokio::select! {
             // ---- IPC message from main process ----
-            Some(msg) = ipc_msg_rx.recv() => {
+            msg = async {
+                tokio::select! {
+                    biased;
+                    Some(msg) = ipc_control_rx.recv() => Some(msg),
+                    Some(msg) = ipc_audio_rx.recv() => Some(msg),
+                    else => None,
+                }
+            } => {
+                let Some(msg) = msg else {
+                    break;
+                };
                 match msg {
                     InMsg::Join { guild_id: gid, channel_id: cid, _self_deaf: _, self_mute: sm } => {
                         let g: u64 = match gid.parse() {
                             Ok(v) => v,
-                            Err(_) => { send_error("Invalid guild ID"); continue; }
+                            Err(_) => {
+                                send_error(
+                                    ErrorCode::InvalidRequest,
+                                    format!("join requires a numeric guild_id, got {:?}", gid),
+                                );
+                                continue;
+                            }
                         };
                         let c: u64 = match cid.parse() {
                             Ok(v) => v,
-                            Err(_) => { send_error("Invalid channel ID"); continue; }
+                            Err(_) => {
+                                send_error(
+                                    ErrorCode::InvalidRequest,
+                                    format!("join requires a numeric channel_id, got {:?}", cid),
+                                );
+                                continue;
+                            }
                         };
                         guild_id = Some(g);
                         channel_id = Some(c);
@@ -274,7 +261,10 @@ async fn main() {
                     InMsg::VoiceState { data } => {
                         let new_sid = data.session_id.clone();
                         let old_sid = pending_conn.session_id.clone();
-                        let new_uid = data.user_id.as_deref().and_then(|s| s.parse::<u64>().ok());
+                        let new_uid = match data.user_id.as_deref() {
+                            Some(user_id) => parse_user_id_field(user_id, "voice_state"),
+                            None => None,
+                        };
                         let new_channel = data.channel_id.clone();
                         info!(
                             "IPC voice_state: session_id={:?} prev_session_id={:?} channel_id={:?} user_id={:?} connected={}",
@@ -398,26 +388,28 @@ async fn main() {
                     } => {
                         default_recv_sample_rate = normalize_sample_rate(sample_rate);
                         default_silence_duration_ms = normalize_silence_duration_ms(silence_duration_ms);
-                        if let Ok(uid) = user_id.parse::<u64>() {
-                            let state = user_capture_states.entry(uid).or_insert_with(|| {
-                                UserCaptureState::new(
-                                    default_recv_sample_rate,
-                                    default_silence_duration_ms,
-                                )
-                            });
-                            state.sample_rate = default_recv_sample_rate;
-                            state.silence_duration_ms = default_silence_duration_ms;
-                        }
+                        let Some(uid) = parse_user_id_field(&user_id, "subscribe_user") else {
+                            continue;
+                        };
+                        let state = user_capture_states.entry(uid).or_insert_with(|| {
+                            UserCaptureState::new(
+                                default_recv_sample_rate,
+                                default_silence_duration_ms,
+                            )
+                        });
+                        state.sample_rate = default_recv_sample_rate;
+                        state.silence_duration_ms = default_silence_duration_ms;
                     }
 
                     InMsg::UnsubscribeUser { user_id } => {
-                        if let Ok(uid) = user_id.parse::<u64>() {
-                            if let Some(state) = user_capture_states.remove(&uid) {
-                                if state.stream_active {
-                                    send_msg(&OutMsg::UserAudioEnd {
-                                        user_id: uid.to_string(),
-                                    });
-                                }
+                        let Some(uid) = parse_user_id_field(&user_id, "unsubscribe_user") else {
+                            continue;
+                        };
+                        if let Some(state) = user_capture_states.remove(&uid) {
+                            if state.stream_active {
+                                send_msg(&OutMsg::UserAudioEnd {
+                                    user_id: uid.to_string(),
+                                });
                             }
                         }
                     }
@@ -533,42 +525,49 @@ async fn main() {
                     }
 
                     InMsg::ConnectAsr { user_id, api_key, model, language, prompt } => {
-                        let uid = user_id.parse::<u64>().unwrap_or(0);
-                        if uid != 0 {
-                            // Drop any existing ASR channel for this user before creating a new one
-                            asr_txs.remove(&uid);
+                        let Some(uid) = parse_user_id_field(&user_id, "connect_asr") else {
+                            continue;
+                        };
 
-                            let (asr_tx, asr_rx) = tokio::sync::mpsc::unbounded_channel();
-                            asr_txs.insert(uid, asr_tx);
+                        // Drop any existing ASR channel for this user before creating a new one
+                        asr_txs.remove(&uid);
 
-                            let exit_tx = asr_exit_tx.clone();
-                            tokio::spawn(async move {
-                                let reason = match run_asr_client(user_id.clone(), api_key, model, language, prompt, asr_rx).await {
-                                    Ok(()) => "closed".to_string(),
-                                    Err(e) => {
-                                        error!("ASR client {} exited: {}", user_id, e);
-                                        format!("{}", e)
-                                    }
-                                };
-                                let _ = exit_tx.send((uid, reason)).await;
-                            });
-                        }
+                        let (asr_tx, asr_rx) = tokio::sync::mpsc::unbounded_channel();
+                        asr_txs.insert(uid, asr_tx);
+
+                        let exit_tx = asr_exit_tx.clone();
+                        tokio::spawn(async move {
+                            let reason = match run_asr_client(user_id.clone(), api_key, model, language, prompt, asr_rx).await {
+                                Ok(()) => "closed".to_string(),
+                                Err(e) => {
+                                    error!("ASR client {} exited: {}", user_id, e);
+                                    format!("{}", e)
+                                }
+                            };
+                            let _ = exit_tx.send((uid, reason)).await;
+                        });
                     }
 
                     InMsg::DisconnectAsr { user_id } => {
-                        let uid = user_id.parse::<u64>().unwrap_or(0);
+                        let Some(uid) = parse_user_id_field(&user_id, "disconnect_asr") else {
+                            continue;
+                        };
                         asr_txs.remove(&uid);
                     }
 
                     InMsg::CommitAsr { user_id } => {
-                        let uid = user_id.parse::<u64>().unwrap_or(0);
+                        let Some(uid) = parse_user_id_field(&user_id, "commit_asr") else {
+                            continue;
+                        };
                         if let Some(tx) = asr_txs.get(&uid) {
                             let _ = tx.send(AsrCommand::Commit);
                         }
                     }
 
                     InMsg::ClearAsr { user_id } => {
-                        let uid = user_id.parse::<u64>().unwrap_or(0);
+                        let Some(uid) = parse_user_id_field(&user_id, "clear_asr") else {
+                            continue;
+                        };
                         if let Some(tx) = asr_txs.get(&uid) {
                             let _ = tx.send(AsrCommand::Clear);
                         }
@@ -765,7 +764,7 @@ async fn main() {
 
                     VoiceEvent::Error { message } => {
                         error!("Voice connection error: {}", message);
-                        send_msg(&OutMsg::Error { message });
+                        send_error(ErrorCode::VoiceRuntimeError, message);
                     }
                 }
             }
@@ -1199,9 +1198,10 @@ async fn try_connect(
         }
         Err(e) => {
             error!("Voice connection failed: {}", e);
-            send_msg(&OutMsg::Error {
-                message: format!("Voice connect failed: {}", e),
-            });
+            send_error(
+                ErrorCode::VoiceConnectFailed,
+                format!("Voice connect failed: {}", e),
+            );
             TryConnectOutcome::Failed
         }
     }
