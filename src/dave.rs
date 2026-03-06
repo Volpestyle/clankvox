@@ -397,3 +397,59 @@ impl DaveManager {
         self.protocol_version
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::{DaveManager, PENDING_DOWNGRADE_AUTO_EXECUTE_SECS};
+
+    fn new_manager() -> DaveManager {
+        DaveManager::new(1, 42, 24)
+            .expect("manager should initialize")
+            .0
+    }
+
+    #[test]
+    fn transition_zero_executes_immediately() {
+        let mut manager = new_manager();
+
+        assert!(!manager.prepare_transition(0, 0));
+        assert_eq!(manager.protocol_version(), 0);
+        assert!(!manager.has_pending_transition_id(0));
+    }
+
+    #[test]
+    fn transition_zero_is_not_tracked_as_pending() {
+        let mut manager = new_manager();
+
+        manager.store_pending_transition(0);
+
+        assert!(!manager.has_pending_transition_id(0));
+        assert_eq!(manager.last_transition_id, 0);
+        assert!(!manager.reinitializing);
+    }
+
+    #[test]
+    fn decrypt_failures_are_suppressed_while_transition_is_pending() {
+        let mut manager = new_manager();
+
+        assert!(manager.prepare_transition(7, 1));
+        assert!(!manager.track_decrypt_failure());
+        assert_eq!(manager.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn pending_downgrade_auto_executes_after_timeout() {
+        let mut manager = new_manager();
+
+        assert!(manager.prepare_transition(9, 0));
+        manager.pending_downgrade_since =
+            Some(Instant::now() - Duration::from_secs(PENDING_DOWNGRADE_AUTO_EXECUTE_SECS + 1));
+
+        assert_eq!(manager.maybe_auto_execute_downgrade(), Some(9));
+        assert_eq!(manager.protocol_version(), 0);
+        assert!(!manager.has_pending_transition_id(9));
+        assert!(manager.pending_downgrade_since.is_none());
+    }
+}

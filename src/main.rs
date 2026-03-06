@@ -1,615 +1,75 @@
+mod asr;
+mod audio_pipeline;
+mod capture;
 mod dave;
+mod ipc;
+mod music;
 mod voice_conn;
 
-use std::collections::{hash_map::Entry, HashMap, VecDeque};
-use std::io::{self, BufRead, Write};
-use std::os::unix::process::CommandExt;
-use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::collections::{hash_map::Entry, HashMap};
+use std::future;
+use std::io::{self, BufRead};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
-use audiopus::coder::{Decoder as OpusDecoder, Encoder as OpusEncoder};
+use audiopus::coder::Decoder as OpusDecoder;
 use audiopus::packet::Packet as OpusPacket;
-use audiopus::{Application, Channels, MutSignals, SampleRate};
+use audiopus::{Channels, MutSignals, SampleRate};
 use base64::Engine as _;
 use crossbeam_channel as crossbeam;
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
+use crate::asr::{run_asr_client, AsrCommand};
+use crate::audio_pipeline::{
+    clear_audio_send_buffer, clear_tts_send_buffer, convert_decoded_to_llm,
+    convert_llm_to_48k_mono, emit_playback_armed, AudioSendState,
+};
+use crate::capture::{
+    normalize_sample_rate, normalize_silence_duration_ms, SpeakingState, UserCaptureState,
+    SPEAKING_TIMEOUT_MS,
+};
 use crate::dave::DaveManager;
+use crate::ipc::{
+    default_sample_rate, default_silence_duration, send_buffer_depth, send_error,
+    send_gateway_voice_state_update, send_msg, send_tts_playback_state, spawn_ipc_writer, InMsg,
+    OutMsg,
+};
+use crate::music::{
+    drain_music_pcm_queue, is_music_output_drained, start_music_pipeline, MusicEvent, MusicState,
+};
 use crate::voice_conn::{VoiceConnection, VoiceEvent};
 
-// ---------------------------------------------------------------------------
-// Global IPC output channel — all threads send OutMsg through this channel,
-// a dedicated writer thread serializes and flushes them to stdout.
-// ---------------------------------------------------------------------------
+fn schedule_reconnect(
+    reconnect_deadline: &mut Option<time::Instant>,
+    reconnect_attempt: &mut u32,
+    guild_id: Option<u64>,
+    channel_id: Option<u64>,
+    self_mute: bool,
+    reason: &str,
+) {
+    let (Some(guild_id), Some(channel_id)) = (guild_id, channel_id) else {
+        warn!(reason = reason, "reconnect skipped: missing guild/channel");
+        return;
+    };
 
-static IPC_TX: std::sync::OnceLock<crossbeam::Sender<OutMsg>> = std::sync::OnceLock::new();
+    *reconnect_attempt = reconnect_attempt.saturating_add(1);
+    let backoff_shift = reconnect_attempt.saturating_sub(1).min(4);
+    let backoff_ms = 1_000u64 << backoff_shift;
+    *reconnect_deadline = Some(time::Instant::now() + Duration::from_millis(backoff_ms));
 
-// ---------------------------------------------------------------------------
-// IPC message types — must match clankvoxClient.ts exactly
-// ---------------------------------------------------------------------------
-
-#[derive(Deserialize, Debug)]
-#[serde(tag = "type")]
-#[serde(rename_all = "snake_case")]
-enum InMsg {
-    Join {
-        #[serde(rename = "guildId")]
-        guild_id: String,
-        #[serde(rename = "channelId")]
-        channel_id: String,
-        #[serde(rename = "selfDeaf", default)]
-        _self_deaf: bool,
-        #[serde(rename = "selfMute", default)]
-        self_mute: bool,
-    },
-    VoiceServer {
-        data: VoiceServerData,
-    },
-    VoiceState {
-        data: VoiceStateData,
-    },
-    Audio {
-        #[serde(rename = "pcmBase64")]
-        pcm_base64: String,
-        #[serde(rename = "sampleRate", default = "default_sample_rate")]
-        sample_rate: u32,
-    },
-    StopPlayback,
-    StopTtsPlayback,
-    SubscribeUser {
-        #[serde(rename = "userId")]
-        user_id: String,
-        #[serde(rename = "silenceDurationMs", default = "default_silence_duration")]
-        silence_duration_ms: u32,
-        #[serde(rename = "sampleRate", default = "default_sample_rate")]
-        sample_rate: u32,
-    },
-    UnsubscribeUser {
-        #[serde(rename = "userId")]
-        user_id: String,
-    },
-    MusicPlay {
-        url: String,
-        #[serde(rename = "resolvedDirectUrl", default)]
-        resolved_direct_url: bool,
-    },
-    MusicStop,
-    MusicPause,
-    MusicResume,
-    MusicSetGain {
-        target: f32,
-        #[serde(rename = "fadeMs", default)]
-        fade_ms: u32,
-    },
-    ConnectAsr {
-        #[serde(rename = "userId")]
-        user_id: String,
-        #[serde(rename = "apiKey")]
-        api_key: String,
-        model: String,
-        language: Option<String>,
-        prompt: Option<String>,
-    },
-    DisconnectAsr {
-        #[serde(rename = "userId")]
-        user_id: String,
-    },
-    CommitAsr {
-        #[serde(rename = "userId")]
-        user_id: String,
-    },
-    ClearAsr {
-        #[serde(rename = "userId")]
-        user_id: String,
-    },
-    Destroy,
-}
-
-fn default_sample_rate() -> u32 {
-    24000
-}
-fn default_silence_duration() -> u32 {
-    700
-}
-
-#[derive(Serialize, Debug, Clone)]
-#[serde(tag = "type")]
-#[serde(rename_all = "snake_case")]
-enum OutMsg {
-    Ready,
-    AdapterSend {
-        payload: Value,
-    },
-    ConnectionState {
-        status: String,
-    },
-    PlayerState {
-        status: String,
-    },
-    PlaybackArmed {
-        reason: String,
-    },
-    TtsPlaybackState {
-        status: String,
-    },
-    SpeakingStart {
-        #[serde(rename = "userId")]
-        user_id: String,
-    },
-    SpeakingEnd {
-        #[serde(rename = "userId")]
-        user_id: String,
-    },
-    UserAudio {
-        #[serde(rename = "userId")]
-        user_id: String,
-        #[serde(skip)]
-        pcm: Vec<u8>,
-        #[serde(skip)]
-        signal_peak_abs: u16,
-        #[serde(skip)]
-        signal_active_sample_count: usize,
-        #[serde(skip)]
-        signal_sample_count: usize,
-    },
-    UserAudioEnd {
-        #[serde(rename = "userId")]
-        user_id: String,
-    },
-    ClientDisconnect {
-        #[serde(rename = "userId")]
-        user_id: String,
-    },
-    MusicIdle,
-    MusicError {
-        message: String,
-    },
-    MusicGainReached {
-        gain: f32,
-    },
-    AsrTranscript {
-        #[serde(rename = "userId")]
-        user_id: String,
-        text: String,
-        #[serde(rename = "isFinal")]
-        is_final: bool,
-    },
-    AsrDisconnected {
-        #[serde(rename = "userId")]
-        user_id: String,
-        reason: String,
-    },
-    Error {
-        message: String,
-    },
-    BufferDepth {
-        #[serde(rename = "ttsSamples")]
-        tts_samples: usize,
-        #[serde(rename = "musicSamples")]
-        music_samples: usize,
-    },
-}
-
-#[derive(Deserialize, Debug, Clone)]
-struct VoiceServerData {
-    endpoint: Option<String>,
-    token: Option<String>,
-}
-
-#[derive(Deserialize, Debug, Clone)]
-struct VoiceStateData {
-    session_id: Option<String>,
-    user_id: Option<String>,
-    channel_id: Option<String>,
-}
-
-fn is_lossy_ipc_msg(msg: &OutMsg) -> bool {
-    matches!(msg, OutMsg::UserAudio { .. })
-}
-
-fn send_msg(msg: &OutMsg) {
-    if let Some(tx) = IPC_TX.get() {
-        if is_lossy_ipc_msg(msg) {
-            if let Err(err) = tx.try_send(msg.clone()) {
-                if !matches!(err, crossbeam::TrySendError::Full(_)) {
-                    error!("failed to send lossy IPC message: {}", err);
-                }
-            }
-        } else if let Err(err) = tx.send(msg.clone()) {
-            error!("failed to send IPC message: {}", err);
-        }
-    }
-}
-
-fn send_error(message: &str) {
-    send_msg(&OutMsg::Error {
-        message: message.to_string(),
+    send_msg(&OutMsg::ConnectionState {
+        status: "reconnecting".into(),
     });
-}
-
-fn send_tts_playback_state(status: &str, reason: &str) {
-    info!(
-        status = status,
+    send_gateway_voice_state_update(guild_id, channel_id, self_mute);
+    warn!(
+        attempt = *reconnect_attempt,
+        backoff_ms = backoff_ms,
         reason = reason,
-        "clankvox_tts_playback_state"
+        "scheduled clankvox voice reconnect"
     );
-    send_msg(&OutMsg::TtsPlaybackState {
-        status: status.to_string(),
-    });
-}
-
-fn send_buffer_depth(tts_samples: usize, music_samples: usize, reason: &str) {
-    info!(
-        tts_samples = tts_samples,
-        music_samples = music_samples,
-        reason = reason,
-        "clankvox_buffer_depth"
-    );
-    send_msg(&OutMsg::BufferDepth {
-        tts_samples,
-        music_samples,
-    });
-}
-
-fn spawn_ipc_writer() -> crossbeam::Sender<OutMsg> {
-    // Bounded channel: at 250 audio msgs/sec (5 users × 50 fps) this gives ~2s of headroom.
-    // If the parent process stalls on reading stdout, audio frames are dropped rather than OOMing.
-    let (tx, rx) = crossbeam::bounded::<OutMsg>(512);
-    std::thread::spawn(move || {
-        let mut out = io::stdout().lock();
-        for msg in rx {
-            match msg {
-                OutMsg::UserAudio {
-                    user_id,
-                    pcm,
-                    signal_peak_abs,
-                    signal_active_sample_count,
-                    signal_sample_count,
-                } => {
-                    let uid = user_id.parse::<u64>().unwrap_or(0);
-                    let mut payload = Vec::with_capacity(8 + 2 + 4 + 4 + pcm.len());
-                    payload.extend_from_slice(&uid.to_le_bytes());
-                    payload.extend_from_slice(&signal_peak_abs.to_le_bytes());
-                    payload.extend_from_slice(&(signal_active_sample_count as u32).to_le_bytes());
-                    payload.extend_from_slice(&(signal_sample_count as u32).to_le_bytes());
-                    payload.extend_from_slice(&pcm);
-
-                    let len = payload.len() as u32;
-                    let _ = out.write_all(&[1]); // Format 1 = Binary Audio
-                    let _ = out.write_all(&len.to_le_bytes());
-                    let _ = out.write_all(&payload);
-                    let _ = out.flush();
-                }
-                other => {
-                    if let Ok(json) = serde_json::to_string(&other) {
-                        let payload = json.as_bytes();
-                        let len = payload.len() as u32;
-                        let _ = out.write_all(&[0]); // Format 0 = JSON
-                        let _ = out.write_all(&len.to_le_bytes());
-                        let _ = out.write_all(payload);
-                        let _ = out.flush();
-                    }
-                }
-            }
-        }
-    });
-    tx
-}
-
-// ---------------------------------------------------------------------------
-// ASR WebSocket Client
-// ---------------------------------------------------------------------------
-
-use base64::engine::general_purpose::STANDARD;
-use futures_util::{SinkExt, StreamExt};
-use serde_json::json;
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
-use tokio_tungstenite::tungstenite::protocol::Message;
-
-pub enum AsrCommand {
-    Audio(Vec<u8>),
-    Commit,
-    Clear,
-}
-
-async fn run_asr_client(
-    user_id: String,
-    api_key: String,
-    model: String,
-    language: Option<String>,
-    prompt: Option<String>,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<AsrCommand>,
-) -> anyhow::Result<()> {
-    let url = "wss://api.openai.com/v1/realtime?intent=transcription";
-    let mut request = url.into_client_request()?;
-    request
-        .headers_mut()
-        .insert(AUTHORIZATION, format!("Bearer {}", api_key).parse()?);
-    request
-        .headers_mut()
-        .insert("OpenAI-Beta", "realtime=v1".parse()?);
-
-    let (ws_stream, _) = connect_async(request).await?;
-    let (mut write, mut read) = ws_stream.split();
-
-    // Send session setup
-    let mut transcription_cfg = json!({
-        "model": model,
-    });
-    if let Some(l) = language {
-        if !l.is_empty() {
-            transcription_cfg
-                .as_object_mut()
-                .unwrap()
-                .insert("language".into(), json!(l));
-        }
-    }
-    if let Some(p) = prompt {
-        if !p.is_empty() {
-            transcription_cfg
-                .as_object_mut()
-                .unwrap()
-                .insert("prompt".into(), json!(p));
-        }
-    }
-
-    let setup_msg = json!({
-        "type": "session.update",
-        "session": {
-            "type": "transcription",
-            "audio": {
-                "input": {
-                    "format": {
-                        "type": "audio/pcm",
-                        "rate": 24000
-                    },
-                    "noise_reduction": {
-                        "type": "near_field"
-                    },
-                    "turn_detection": {
-                        "type": "server_vad",
-                        "threshold": 0.55,
-                        "prefix_padding_ms": 240,
-                        "silence_duration_ms": 450,
-                        "create_response": false,
-                        "interrupt_response": false
-                    },
-                    "transcription": transcription_cfg
-                }
-            }
-        },
-        "include": ["item.input_audio_transcription.logprobs"]
-    });
-
-    write.send(Message::Text(setup_msg.to_string())).await?;
-
-    loop {
-        tokio::select! {
-            Some(cmd) = rx.recv() => {
-                match cmd {
-                    AsrCommand::Audio(pcm) => {
-                        let b64 = STANDARD.encode(&pcm);
-                        let append_msg = json!({
-                            "type": "input_audio_buffer.append",
-                            "audio": b64
-                        });
-                        if write.send(Message::Text(append_msg.to_string())).await.is_err() {
-                            break;
-                        }
-                    }
-                    AsrCommand::Commit => {
-                        let commit_msg = json!({
-                            "type": "input_audio_buffer.commit"
-                        });
-                        let _ = write.send(Message::Text(commit_msg.to_string())).await;
-                    }
-                    AsrCommand::Clear => {
-                        let clear_msg = json!({
-                            "type": "input_audio_buffer.clear"
-                        });
-                        let _ = write.send(Message::Text(clear_msg.to_string())).await;
-                    }
-                }
-            }
-            Some(msg_res) = read.next() => {
-                let msg = match msg_res {
-                    Ok(m) => m,
-                    Err(_) => break, // WebSocket closed or errored
-                };
-                if let Message::Text(text) = msg {
-                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
-                        let msg_type = value.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                        if msg_type == "conversation.item.input_audio_transcription.delta" {
-                            if let Some(delta) = value.get("delta").and_then(|d| d.as_str()) {
-                                send_msg(&OutMsg::AsrTranscript {
-                                    user_id: user_id.clone(),
-                                    text: delta.to_string(),
-                                    is_final: false,
-                                });
-                            }
-                        } else if msg_type == "conversation.item.input_audio_transcription.completed" {
-                            if let Some(transcript) = value.get("transcript").and_then(|t| t.as_str()) {
-                                send_msg(&OutMsg::AsrTranscript {
-                                    user_id: user_id.clone(),
-                                    text: transcript.to_string(),
-                                    is_final: true,
-                                });
-                            }
-                        } else if msg_type == "error" {
-                            if let Some(err) = value.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
-                                error!("OpenAI ASR error for user {}: {}", user_id, err);
-                            }
-                        }
-                    }
-                }
-            }
-            else => break,
-        }
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn music_output_not_drained_while_pcm_queue_has_chunks() {
-        let (music_pcm_tx, music_pcm_rx) = crossbeam::bounded::<Vec<i16>>(4);
-        let audio_send_state = Arc::new(Mutex::new(Some(
-            AudioSendState::new().expect("audio state"),
-        )));
-
-        music_pcm_tx.send(vec![0; 960]).expect("queue chunk");
-
-        assert!(!is_music_output_drained(&music_pcm_rx, &audio_send_state));
-    }
-
-    #[test]
-    fn music_output_not_drained_while_mixer_buffer_has_music() {
-        let (_music_pcm_tx, music_pcm_rx) = crossbeam::bounded::<Vec<i16>>(4);
-        let audio_send_state = Arc::new(Mutex::new(Some(
-            AudioSendState::new().expect("audio state"),
-        )));
-        {
-            let mut guard = audio_send_state.lock();
-            let state = guard.as_mut().expect("state");
-            state.push_music_pcm(vec![0; 960]);
-        }
-
-        assert!(!is_music_output_drained(&music_pcm_rx, &audio_send_state));
-    }
-
-    #[test]
-    fn music_output_drained_when_queue_and_mixer_are_empty() {
-        let (_music_pcm_tx, music_pcm_rx) = crossbeam::bounded::<Vec<i16>>(4);
-        let audio_send_state = Arc::new(Mutex::new(Some(
-            AudioSendState::new().expect("audio state"),
-        )));
-
-        assert!(is_music_output_drained(&music_pcm_rx, &audio_send_state));
-    }
-
-    #[test]
-    fn direct_music_pipeline_command_skips_ytdlp() {
-        let command = build_music_pipeline_command("https://cdn.example.com/audio.m4a", true);
-        assert!(command.starts_with("ffmpeg "));
-        assert!(!command.contains("yt-dlp"));
-    }
-
-    #[test]
-    fn unresolved_music_pipeline_command_uses_ytdlp() {
-        let command = build_music_pipeline_command("https://www.youtube.com/watch?v=abc123", false);
-        assert!(command.contains("yt-dlp"));
-        assert!(command.contains("| ffmpeg "));
-    }
-
-    #[test]
-    fn tts_partial_tail_flushes_after_short_stall() {
-        let mut state = AudioSendState::new().expect("audio state");
-        state.push_pcm(vec![123; 480]);
-
-        assert_eq!(state.tts_buffer_samples(), 480);
-        assert!(state.next_opus_frame().is_none());
-        assert_eq!(state.tts_buffer_samples(), 480);
-
-        let frame = state.next_opus_frame().expect("partial tail should flush");
-        assert!(!frame.is_empty());
-        assert_eq!(state.tts_buffer_samples(), 0);
-    }
-
-    #[test]
-    fn tts_partial_tail_coalesces_before_flush_threshold() {
-        let mut state = AudioSendState::new().expect("audio state");
-        state.push_pcm(vec![123; 480]);
-
-        assert!(state.next_opus_frame().is_none());
-        state.push_pcm(vec![123; 480]);
-
-        let frame = state
-            .next_opus_frame()
-            .expect("full frame should encode once tail grows");
-        assert!(!frame.is_empty());
-        assert_eq!(state.tts_buffer_samples(), 0);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// PCM resampling
-// ---------------------------------------------------------------------------
-
-fn resample_mono_i16(input: &[i16], in_rate: u32, out_rate: u32) -> Vec<i16> {
-    if in_rate == out_rate || input.len() <= 1 {
-        return input.to_vec();
-    }
-    let ratio = in_rate as f64 / out_rate as f64;
-    let out_len = ((input.len() as f64) / ratio).floor() as usize;
-    if out_len == 0 {
-        return vec![];
-    }
-    let mut output = Vec::with_capacity(out_len);
-    for i in 0..out_len {
-        let src_pos = i as f64 * ratio;
-        let idx = src_pos.floor() as usize;
-        let next = (idx + 1).min(input.len() - 1);
-        let frac = src_pos - idx as f64;
-        let sample = input[idx] as f64 + frac * (input[next] as f64 - input[idx] as f64);
-        output.push(sample.round().clamp(-32768.0, 32767.0) as i16);
-    }
-    output
-}
-
-/// Convert LLM output (mono i16 LE at `in_rate`) to 48kHz mono i16 for Opus encoding.
-fn convert_llm_to_48k_mono(pcm: &[u8], in_rate: u32) -> Vec<i16> {
-    let sample_count = pcm.len() / 2;
-    if sample_count == 0 {
-        return vec![];
-    }
-    let mut mono = Vec::with_capacity(sample_count);
-    for i in 0..sample_count {
-        mono.push(i16::from_le_bytes([pcm[i * 2], pcm[i * 2 + 1]]));
-    }
-    resample_mono_i16(&mono, in_rate, 48000)
-}
-
-/// Convert decoded stereo i16 48kHz to LLM input (mono i16 LE at `out_rate`).
-/// Returns (LLM input, signal_peak_abs, signal_active_sample_count, signal_sample_count)
-fn convert_decoded_to_llm(stereo_i16: &[i16], out_rate: u32) -> (Vec<u8>, u16, usize, usize) {
-    let frame_count = stereo_i16.len() / 2;
-    if frame_count == 0 {
-        return (vec![], 0, 0, 0);
-    }
-    let mut mono = Vec::with_capacity(frame_count);
-    for i in 0..frame_count {
-        let l = stereo_i16[i * 2] as i32;
-        let r = stereo_i16[i * 2 + 1] as i32;
-        mono.push(((l + r) / 2).clamp(-32768, 32767) as i16);
-    }
-    let resampled = resample_mono_i16(&mono, 48000, out_rate);
-    let mut buf = Vec::with_capacity(resampled.len() * 2);
-    let mut max_amp: u16 = 0;
-    let mut active_samples = 0;
-    for &s in &resampled {
-        buf.extend_from_slice(&s.to_le_bytes());
-        let abs_val = s.unsigned_abs();
-        if abs_val > max_amp {
-            max_amp = abs_val;
-        }
-        if abs_val > 500 {
-            active_samples += 1;
-        }
-    }
-    (buf, max_amp, active_samples, resampled.len())
 }
 
 // ---------------------------------------------------------------------------
@@ -622,635 +82,6 @@ struct PendingConnection {
     token: Option<String>,
     session_id: Option<String>,
     user_id: Option<u64>,
-}
-
-// ---------------------------------------------------------------------------
-// Gain envelope for smooth volume transitions
-// ---------------------------------------------------------------------------
-
-struct GainEnvelope {
-    current: f32,
-    target: f32,
-    step_per_sample: f32,
-}
-
-impl GainEnvelope {
-    fn new(current: f32, target: f32, fade_ms: u32) -> Self {
-        let total_samples = 48_000.0 * fade_ms as f64 / 1000.0;
-        let step = if total_samples > 0.0 {
-            (target as f64 - current as f64) / total_samples
-        } else {
-            0.0
-        };
-        Self {
-            current,
-            target,
-            step_per_sample: step as f32,
-        }
-    }
-
-    fn apply_sample(&mut self, sample: i16) -> i16 {
-        let out = (sample as f32 * self.current).clamp(-32768.0, 32767.0) as i16;
-        self.advance();
-        out
-    }
-
-    fn advance(&mut self) {
-        if (self.step_per_sample > 0.0 && self.current < self.target)
-            || (self.step_per_sample < 0.0 && self.current > self.target)
-        {
-            self.current += self.step_per_sample;
-            if (self.step_per_sample > 0.0 && self.current > self.target)
-                || (self.step_per_sample < 0.0 && self.current < self.target)
-            {
-                self.current = self.target;
-            }
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        (self.current - self.target).abs() < 0.0001
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Audio send state (outbound TTS + music pipeline with mixing)
-// ---------------------------------------------------------------------------
-
-struct AudioSendState {
-    pcm_buffer: VecDeque<i16>,   // TTS audio
-    music_buffer: VecDeque<i16>, // Music audio (separate for mixing)
-    music_gain: GainEnvelope,    // Gain envelope applied to music
-    music_gain_notified: f32,    // Last gain value we sent MusicGainReached for
-    encoder: OpusEncoder,
-    speaking: bool,
-    trailing_silence_frames: u32,
-    partial_tts_stall_ticks: u32,
-}
-
-const MAX_TRAILING_SILENCE: u32 = 5; // 100ms of trailing silence
-const MAX_PCM_BUFFER_SAMPLES: usize = 720_000; // 15 seconds @ 48kHz mono
-const PARTIAL_TTS_FLUSH_TICKS: u32 = 2; // Flush an underfilled tail after 40ms of no growth
-
-impl AudioSendState {
-    fn new() -> Result<Self> {
-        let encoder = OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip)
-            .map_err(|e| anyhow::anyhow!("Opus encoder init: {:?}", e))?;
-        Ok(Self {
-            pcm_buffer: VecDeque::new(),
-            music_buffer: VecDeque::new(),
-            music_gain: GainEnvelope::new(1.0, 1.0, 0),
-            music_gain_notified: 1.0,
-            encoder,
-            speaking: false,
-            trailing_silence_frames: 0,
-            partial_tts_stall_ticks: 0,
-        })
-    }
-
-    fn push_pcm(&mut self, samples: Vec<i16>) {
-        self.pcm_buffer.extend(samples);
-        // Drop oldest samples to keep the buffer bounded (prevents runaway latency)
-        if self.pcm_buffer.len() > MAX_PCM_BUFFER_SAMPLES {
-            let overflow = self.pcm_buffer.len() - MAX_PCM_BUFFER_SAMPLES;
-            warn!(
-                "TTS PCM buffer overflow: dropping {} oldest samples ({:.1}ms), buffer was {} samples ({:.1}ms)",
-                overflow,
-                overflow as f64 / 48.0,
-                self.pcm_buffer.len(),
-                self.pcm_buffer.len() as f64 / 48.0
-            );
-            self.pcm_buffer.drain(..overflow);
-        }
-        self.trailing_silence_frames = 0;
-        self.partial_tts_stall_ticks = 0;
-    }
-
-    fn push_music_pcm(&mut self, samples: Vec<i16>) {
-        self.music_buffer.extend(samples);
-        self.trailing_silence_frames = 0;
-    }
-
-    fn set_music_gain(&mut self, target: f32, fade_ms: u32) {
-        self.music_gain = GainEnvelope::new(self.music_gain.current, target, fade_ms);
-    }
-
-    fn tts_buffer_samples(&self) -> usize {
-        self.pcm_buffer.len()
-    }
-
-    fn music_buffer_samples(&self) -> usize {
-        self.music_buffer.len()
-    }
-
-    fn clear(&mut self) {
-        self.pcm_buffer.clear();
-        self.music_buffer.clear();
-        self.trailing_silence_frames = MAX_TRAILING_SILENCE;
-        self.partial_tts_stall_ticks = 0;
-    }
-
-    fn clear_tts(&mut self) {
-        self.pcm_buffer.clear();
-        self.partial_tts_stall_ticks = 0;
-    }
-
-    /// Encode the next 20ms frame, mixing TTS and music buffers.
-    /// Music samples have the gain envelope applied. Returns None if idle.
-    fn next_opus_frame(&mut self) -> Option<Vec<u8>> {
-        const FRAME_SIZE: usize = 960; // 20ms @ 48kHz mono
-
-        let available_tts = self.pcm_buffer.len();
-        let available_music = self.music_buffer.len();
-        let has_music = available_music >= FRAME_SIZE;
-        let has_full_tts = available_tts >= FRAME_SIZE;
-        let has_partial_tts = available_tts > 0 && available_tts < FRAME_SIZE;
-
-        if has_full_tts {
-            self.partial_tts_stall_ticks = 0;
-        } else if has_partial_tts {
-            self.partial_tts_stall_ticks = self.partial_tts_stall_ticks.saturating_add(1);
-        } else {
-            self.partial_tts_stall_ticks = 0;
-        }
-
-        let flush_partial_tts = has_partial_tts
-            && (has_music || self.partial_tts_stall_ticks >= PARTIAL_TTS_FLUSH_TICKS);
-        let tts_samples_to_take = if has_full_tts {
-            FRAME_SIZE
-        } else if flush_partial_tts {
-            available_tts
-        } else {
-            0
-        };
-        let has_tts = tts_samples_to_take > 0;
-
-        if has_tts || has_music {
-            let mut mixed = [0i32; FRAME_SIZE];
-
-            if has_music {
-                for (i, s) in self.music_buffer.drain(..FRAME_SIZE).enumerate() {
-                    mixed[i] += self.music_gain.apply_sample(s) as i32;
-                }
-            }
-            if has_tts {
-                if flush_partial_tts && tts_samples_to_take < FRAME_SIZE {
-                    info!(
-                        queued_samples = available_tts,
-                        stall_ticks = self.partial_tts_stall_ticks,
-                        "clankvox_tts_partial_frame_flushed"
-                    );
-                }
-                for (i, s) in self.pcm_buffer.drain(..tts_samples_to_take).enumerate() {
-                    mixed[i] += s as i32; // TTS at full volume always
-                }
-            }
-
-            let pcm: Vec<i16> = mixed
-                .iter()
-                .map(|&s| s.clamp(-32768, 32767) as i16)
-                .collect();
-
-            let mut opus_buf = vec![0u8; 4000];
-            match self.encoder.encode(&pcm, &mut opus_buf) {
-                Ok(len) => {
-                    self.speaking = true;
-                    self.trailing_silence_frames = 0;
-                    self.partial_tts_stall_ticks = 0;
-                    return Some(opus_buf[..len].to_vec());
-                }
-                Err(e) => {
-                    error!("Opus encode error: {:?}", e);
-                    return None;
-                }
-            }
-        }
-
-        if has_partial_tts {
-            // Hold a short underfilled tail briefly so adjacent deltas can coalesce
-            // into a full 20ms frame; otherwise we would pad too aggressively and
-            // create choppy playback. If the tail does not grow, a later tick will
-            // flush it as a padded final frame.
-            return None;
-        }
-
-        // Buffer empty — send trailing silence to avoid abrupt cutoff
-        if self.trailing_silence_frames < MAX_TRAILING_SILENCE {
-            self.trailing_silence_frames += 1;
-            // Opus silence frame (RFC 6716 comfort noise)
-            return Some(vec![0xF8, 0xFF, 0xFE]);
-        }
-
-        if self.speaking {
-            self.speaking = false;
-        }
-        None
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Music player (yt-dlp + ffmpeg → raw PCM)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug)]
-enum MusicEvent {
-    Idle,
-    Error(String),
-    FirstPcm {
-        startup_ms: u64,
-        resolved_direct_url: bool,
-    },
-}
-
-/// Tracks per-user speaking state driven by actual UDP audio packet arrival.
-#[derive(Clone, Debug)]
-struct SpeakingState {
-    last_packet_at: Option<time::Instant>,
-    is_speaking: bool,
-}
-
-const SPEAKING_TIMEOUT_MS: u64 = 100;
-
-#[derive(Clone, Debug)]
-struct UserCaptureState {
-    sample_rate: u32,
-    silence_duration_ms: u32,
-    stream_active: bool,
-    last_audio_at: Option<time::Instant>,
-}
-
-impl UserCaptureState {
-    fn new(sample_rate: u32, silence_duration_ms: u32) -> Self {
-        Self {
-            sample_rate: normalize_sample_rate(sample_rate),
-            silence_duration_ms: normalize_silence_duration_ms(silence_duration_ms),
-            stream_active: false,
-            last_audio_at: None,
-        }
-    }
-
-    fn touch_audio(&mut self, now: time::Instant) {
-        self.stream_active = true;
-        self.last_audio_at = Some(now);
-    }
-}
-
-fn normalize_sample_rate(sample_rate: u32) -> u32 {
-    sample_rate.clamp(8_000, 48_000)
-}
-
-fn normalize_silence_duration_ms(duration_ms: u32) -> u32 {
-    duration_ms.clamp(100, 5_000)
-}
-
-fn clear_audio_send_buffer(audio_send_state: &Arc<Mutex<Option<AudioSendState>>>) {
-    let mut guard = audio_send_state.lock();
-    if let Some(ref mut state) = *guard {
-        state.clear();
-    }
-}
-
-fn clear_tts_send_buffer(audio_send_state: &Arc<Mutex<Option<AudioSendState>>>) {
-    let mut guard = audio_send_state.lock();
-    if let Some(ref mut state) = *guard {
-        state.clear_tts();
-    }
-}
-
-fn drain_music_pcm_queue(music_pcm_rx: &crossbeam::Receiver<Vec<i16>>) {
-    while music_pcm_rx.try_recv().is_ok() {}
-}
-
-fn is_music_output_drained(
-    music_pcm_rx: &crossbeam::Receiver<Vec<i16>>,
-    audio_send_state: &Arc<Mutex<Option<AudioSendState>>>,
-) -> bool {
-    if !music_pcm_rx.is_empty() {
-        return false;
-    }
-
-    let guard = audio_send_state.lock();
-    guard
-        .as_ref()
-        .map_or(true, |state| state.music_buffer.is_empty())
-}
-
-fn emit_playback_armed(reason: &str, audio_send_state: &Arc<Mutex<Option<AudioSendState>>>) {
-    if audio_send_state.lock().is_some() {
-        send_msg(&OutMsg::PlaybackArmed {
-            reason: reason.to_string(),
-        });
-    }
-}
-
-fn start_music_pipeline(
-    url: &str,
-    music_player: &mut Option<MusicPlayer>,
-    music_pcm_rx: &crossbeam::Receiver<Vec<i16>>,
-    music_pcm_tx: &crossbeam::Sender<Vec<i16>>,
-    music_event_tx: &mpsc::Sender<MusicEvent>,
-    audio_send_state: &Arc<Mutex<Option<AudioSendState>>>,
-    resolved_direct_url: bool,
-    clear_output_buffers: bool,
-) {
-    if let Some(ref mut player) = music_player {
-        player.stop();
-    }
-    *music_player = None;
-    drain_music_pcm_queue(music_pcm_rx);
-    if clear_output_buffers {
-        clear_audio_send_buffer(audio_send_state);
-    }
-    *music_player = Some(MusicPlayer::start(
-        url,
-        music_pcm_tx.clone(),
-        music_event_tx.clone(),
-        resolved_direct_url,
-    ));
-}
-
-const MUSIC_PIPELINE_STDERR_TAIL_LINES: usize = 24;
-
-struct MusicPlayer {
-    stop: Arc<AtomicBool>,
-    child_pid: Arc<AtomicU32>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-
-fn kill_music_process_group(pid: u32, signal: libc::c_int) {
-    if pid == 0 {
-        return;
-    }
-    // SAFETY: `pid` comes from `std::process::Child::id()` and we place the child
-    // shell in its own process group before spawn, so signaling that group is valid.
-    unsafe {
-        libc::killpg(pid as libc::pid_t, signal);
-    }
-}
-
-fn terminate_music_child(child: &mut std::process::Child, signal: libc::c_int) {
-    kill_music_process_group(child.id(), signal);
-}
-
-impl MusicPlayer {
-    fn start(
-        url: &str,
-        pcm_tx: crossbeam::Sender<Vec<i16>>,
-        music_event_tx: mpsc::Sender<MusicEvent>,
-        resolved_direct_url: bool,
-    ) -> Self {
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_clone = stop.clone();
-        let child_pid = Arc::new(AtomicU32::new(0));
-        let child_pid_thread = child_pid.clone();
-        let url = url.to_string();
-
-        let thread = std::thread::spawn(move || {
-            let pipeline_command = build_music_pipeline_command(&url, resolved_direct_url);
-            let pipeline_started_at = time::Instant::now();
-            let child = std::process::Command::new("sh")
-                .process_group(0)
-                .args(["-c", &pipeline_command])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn();
-
-            let mut child = match child {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = music_event_tx.blocking_send(MusicEvent::Error(format!(
-                        "yt-dlp/ffmpeg spawn failed: {}",
-                        e
-                    )));
-                    return;
-                }
-            };
-            child_pid_thread.store(child.id(), Ordering::SeqCst);
-
-            let stderr_tail = Arc::new(Mutex::new(VecDeque::<String>::new()));
-            let mut stderr_thread = child.stderr.take().map(|stderr| {
-                let stderr_tail = stderr_tail.clone();
-                std::thread::spawn(move || {
-                    let reader = io::BufReader::new(stderr);
-                    for line_result in reader.lines() {
-                        let line = match line_result {
-                            Ok(value) => value.trim().to_string(),
-                            Err(_) => break,
-                        };
-                        if line.is_empty() {
-                            continue;
-                        }
-                        let mut tail = stderr_tail.lock();
-                        if tail.len() >= MUSIC_PIPELINE_STDERR_TAIL_LINES {
-                            tail.pop_front();
-                        }
-                        tail.push_back(line);
-                    }
-                })
-            });
-
-            let stdout = match child.stdout.take() {
-                Some(s) => s,
-                None => {
-                    let _ = music_event_tx.blocking_send(MusicEvent::Error(
-                        "music pipeline missing stdout".to_string(),
-                    ));
-                    terminate_music_child(&mut child, libc::SIGTERM);
-                    let _ = child.wait();
-                    if let Some(handle) = stderr_thread.take() {
-                        let _ = handle.join();
-                    }
-                    child_pid_thread.store(0, Ordering::SeqCst);
-                    return;
-                }
-            };
-
-            let mut reader = io::BufReader::with_capacity(48000 * 2, stdout); // 0.5s buffer
-            let mut chunk = vec![0u8; 960 * 2]; // 20ms of mono i16
-            let mut first_pcm_reported = false;
-
-            loop {
-                if stop_clone.load(Ordering::Relaxed) {
-                    break;
-                }
-                match io::Read::read_exact(&mut reader, &mut chunk) {
-                    Ok(()) => {
-                        if !first_pcm_reported {
-                            first_pcm_reported = true;
-                            let startup_ms = pipeline_started_at.elapsed().as_millis() as u64;
-                            info!(
-                                "music pipeline first pcm startup_ms={} direct={}",
-                                startup_ms, resolved_direct_url
-                            );
-                            let _ = music_event_tx.blocking_send(MusicEvent::FirstPcm {
-                                startup_ms,
-                                resolved_direct_url,
-                            });
-                        }
-                        let mut samples = Vec::with_capacity(960);
-                        for i in 0..960 {
-                            samples.push(i16::from_le_bytes([chunk[i * 2], chunk[i * 2 + 1]]));
-                        }
-                        if pcm_tx.send(samples).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-
-            terminate_music_child(&mut child, libc::SIGTERM);
-            let wait_result = child.wait();
-            if let Some(handle) = stderr_thread.take() {
-                let _ = handle.join();
-            }
-            child_pid_thread.store(0, Ordering::SeqCst);
-
-            let stderr_summary = {
-                let tail = stderr_tail.lock();
-                if tail.is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        " | stderr tail: {}",
-                        tail.iter().cloned().collect::<Vec<_>>().join(" || ")
-                    )
-                }
-            };
-
-            if !stop_clone.load(Ordering::Relaxed) {
-                match wait_result {
-                    Ok(status) if status.success() => {
-                        let _ = music_event_tx.blocking_send(MusicEvent::Idle);
-                    }
-                    Ok(status) => {
-                        let _ = music_event_tx.blocking_send(MusicEvent::Error(format!(
-                            "music pipeline exited with status {}{}",
-                            status, stderr_summary
-                        )));
-                    }
-                    Err(error) => {
-                        let _ = music_event_tx.blocking_send(MusicEvent::Error(format!(
-                            "music pipeline wait failed: {}{}",
-                            error, stderr_summary
-                        )));
-                    }
-                }
-            }
-        });
-
-        MusicPlayer {
-            stop,
-            child_pid,
-            thread: Some(thread),
-        }
-    }
-
-    fn stop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        let pid = self.child_pid.load(Ordering::SeqCst);
-        kill_music_process_group(pid, libc::SIGTERM);
-        self.child_pid.store(0, Ordering::SeqCst);
-        if let Some(thread) = self.thread.take() {
-            if thread.is_finished() {
-                let _ = thread.join();
-            } else {
-                // Avoid blocking the async runtime thread on a stuck join.
-                std::thread::spawn(move || {
-                    let _ = thread.join();
-                });
-            }
-        }
-    }
-}
-
-impl Drop for MusicPlayer {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-#[derive(Default)]
-struct MusicState {
-    player: Option<MusicPlayer>,
-    active: bool,
-    paused: bool,
-    finishing: bool,
-    active_url: Option<String>,
-    active_resolved_direct_url: bool,
-    pending_url: Option<String>,
-    pending_received_at: Option<time::Instant>,
-    pending_audio_seen: bool,
-    pending_last_audio_at: Option<time::Instant>,
-    pending_waiting_for_drain: bool,
-    pending_drain_started_at: Option<time::Instant>,
-    pending_first_pcm_at: Option<time::Instant>,
-    pending_resolved_direct_url: bool,
-    pending_stop: bool,
-}
-
-impl MusicState {
-    fn stop_player(&mut self) {
-        if let Some(ref mut player) = self.player {
-            player.stop();
-        }
-        self.player = None;
-    }
-
-    fn clear_pending_start(&mut self) {
-        self.pending_url = None;
-        self.pending_received_at = None;
-        self.pending_audio_seen = false;
-        self.pending_last_audio_at = None;
-        self.pending_waiting_for_drain = false;
-        self.pending_drain_started_at = None;
-        self.pending_first_pcm_at = None;
-        self.pending_resolved_direct_url = false;
-    }
-
-    fn reset(&mut self) {
-        self.stop_player();
-        self.active = false;
-        self.paused = false;
-        self.finishing = false;
-        self.active_url = None;
-        self.active_resolved_direct_url = false;
-        self.pending_stop = false;
-        self.clear_pending_start();
-    }
-
-    fn queue_pending_start(&mut self, url: String, resolved_direct_url: bool) {
-        self.stop_player();
-        self.active = false;
-        self.paused = false;
-        self.finishing = false;
-        self.pending_stop = false;
-        self.active_url = Some(url.clone());
-        self.active_resolved_direct_url = resolved_direct_url;
-        self.pending_url = Some(url);
-        self.pending_received_at = Some(time::Instant::now());
-        self.pending_audio_seen = false;
-        self.pending_last_audio_at = None;
-        self.pending_waiting_for_drain = false;
-        self.pending_drain_started_at = None;
-        self.pending_first_pcm_at = None;
-        self.pending_resolved_direct_url = resolved_direct_url;
-    }
-}
-
-fn build_music_pipeline_command(url: &str, resolved_direct_url: bool) -> String {
-    let quoted_url = url.replace('\'', "'\\''");
-    if resolved_direct_url {
-        format!(
-            "ffmpeg -nostdin -loglevel error -i '{}' -f s16le -ar 48000 -ac 1 pipe:1",
-            quoted_url
-        )
-    } else {
-        format!(
-            "yt-dlp --no-warnings --quiet --no-playlist --extractor-args 'youtube:player_client=android' -f bestaudio/best -o - '{}' | ffmpeg -nostdin -loglevel error -i pipe:0 -f s16le -ar 48000 -ac 1 pipe:1",
-            quoted_url
-        )
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1274,8 +105,7 @@ async fn main() {
         .with_writer(io::stderr)
         .init();
 
-    let ipc_tx = spawn_ipc_writer();
-    IPC_TX.set(ipc_tx).expect("IPC_TX already initialized");
+    spawn_ipc_writer();
 
     // Spawn stdin reader (blocking, off the tokio runtime)
     let (ipc_msg_tx, mut ipc_msg_rx) = mpsc::channel::<InMsg>(256);
@@ -1336,7 +166,9 @@ async fn main() {
     let mut pending_conn = PendingConnection::default();
     let mut guild_id: Option<u64> = None;
     let mut channel_id: Option<u64> = None;
-    let mut _self_mute = false;
+    let mut self_mute = false;
+    let mut reconnect_deadline: Option<time::Instant> = None;
+    let mut reconnect_attempt: u32 = 0;
 
     let dave: Arc<Mutex<Option<DaveManager>>> = Arc::new(Mutex::new(None));
     let mut voice_conn: Option<VoiceConnection> = None;
@@ -1390,20 +222,11 @@ async fn main() {
                         };
                         guild_id = Some(g);
                         channel_id = Some(c);
-                        _self_mute = sm;
+                        self_mute = sm;
+                        reconnect_deadline = None;
+                        reconnect_attempt = 0;
 
-                        // Send OP4 via the gateway adapter proxy
-                        send_msg(&OutMsg::AdapterSend {
-                            payload: serde_json::json!({
-                                "op": 4,
-                                "d": {
-                                    "guild_id": gid,
-                                    "channel_id": cid,
-                                    "self_mute": sm,
-                                    "self_deaf": false,
-                                }
-                            }),
-                        });
+                        send_gateway_voice_state_update(g, c, sm);
                         info!("Join requested guild={} channel={}, sent OP4", g, c);
                     }
 
@@ -1420,14 +243,32 @@ async fn main() {
                         if let Some(tk) = data.token.as_deref() {
                             pending_conn.token = Some(tk.to_string());
                         }
-                        try_connect(
+                        match try_connect(
                             &pending_conn,
                             guild_id,
                             channel_id,
                             &voice_event_tx,
                             &dave,
                             &mut voice_conn,
-                        ).await;
+                        )
+                        .await
+                        {
+                            TryConnectOutcome::Connected => {
+                                reconnect_deadline = None;
+                                reconnect_attempt = 0;
+                            }
+                            TryConnectOutcome::Failed => {
+                                schedule_reconnect(
+                                    &mut reconnect_deadline,
+                                    &mut reconnect_attempt,
+                                    guild_id,
+                                    channel_id,
+                                    self_mute,
+                                    "voice_server_connect_failed",
+                                );
+                            }
+                            _ => {}
+                        }
                     }
 
                     InMsg::VoiceState { data } => {
@@ -1459,14 +300,32 @@ async fn main() {
                             pending_conn.user_id = Some(uid);
                             self_user_id = Some(uid);
                         }
-                        try_connect(
+                        match try_connect(
                             &pending_conn,
                             guild_id,
                             channel_id,
                             &voice_event_tx,
                             &dave,
                             &mut voice_conn,
-                        ).await;
+                        )
+                        .await
+                        {
+                            TryConnectOutcome::Connected => {
+                                reconnect_deadline = None;
+                                reconnect_attempt = 0;
+                            }
+                            TryConnectOutcome::Failed => {
+                                schedule_reconnect(
+                                    &mut reconnect_deadline,
+                                    &mut reconnect_attempt,
+                                    guild_id,
+                                    channel_id,
+                                    self_mute,
+                                    "voice_state_connect_failed",
+                                );
+                            }
+                            _ => {}
+                        }
                     }
 
                     InMsg::Audio { pcm_base64, sample_rate } => {
@@ -1481,7 +340,7 @@ async fn main() {
                         if music.active && !music.paused {
                             let is_ducked = {
                                 let guard = audio_send_state.lock();
-                                guard.as_ref().map_or(false, |s| s.music_gain.target < 1.0)
+                                guard.as_ref().map_or(false, |s| s.is_music_ducked())
                             };
                             if !is_ducked {
                                 continue;
@@ -1596,7 +455,7 @@ async fn main() {
                             // 20ms tick when the fade completes.
                             let mut guard = audio_send_state.lock();
                             if let Some(ref mut state) = *guard {
-                                state.set_music_gain(0.0, 300);
+                                let _ = state.set_music_gain(0.0, 300);
                             }
                             music.pending_stop = true;
                         } else {
@@ -1666,11 +525,9 @@ async fn main() {
                         let clamped = target.clamp(0.0, 1.0);
                         let mut guard = audio_send_state.lock();
                         if let Some(ref mut state) = *guard {
-                            state.set_music_gain(clamped, fade_ms);
-                            if fade_ms == 0 {
-                                state.music_gain_notified = clamped;
+                            if let Some(reached) = state.set_music_gain(clamped, fade_ms) {
                                 drop(guard);
-                                send_msg(&OutMsg::MusicGainReached { gain: clamped });
+                                send_msg(&OutMsg::MusicGainReached { gain: reached });
                             }
                         }
                     }
@@ -1732,6 +589,8 @@ async fn main() {
                 match event {
                     VoiceEvent::Ready { ssrc } => {
                         info!("Voice connection ready, ssrc={}", ssrc);
+                        reconnect_deadline = None;
+                        reconnect_attempt = 0;
                         send_msg(&OutMsg::ConnectionState { status: "ready".into() });
                         send_msg(&OutMsg::Ready);
 
@@ -1894,6 +753,14 @@ async fn main() {
                         ssrc_map.clear();
                         opus_decoders.clear();
                         speaking_states.clear();
+                        schedule_reconnect(
+                            &mut reconnect_deadline,
+                            &mut reconnect_attempt,
+                            guild_id,
+                            channel_id,
+                            self_mute,
+                            &reason,
+                        );
                     }
 
                     VoiceEvent::Error { message } => {
@@ -1972,6 +839,43 @@ async fn main() {
                 });
             }
 
+            _ = async {
+                if let Some(deadline) = reconnect_deadline {
+                    time::sleep_until(deadline).await;
+                } else {
+                    future::pending::<()>().await;
+                }
+            }, if reconnect_deadline.is_some() => {
+                reconnect_deadline = None;
+                let outcome = try_connect(
+                    &pending_conn,
+                    guild_id,
+                    channel_id,
+                    &voice_event_tx,
+                    &dave,
+                    &mut voice_conn,
+                ).await;
+
+                match outcome {
+                    TryConnectOutcome::Connected => {
+                        reconnect_attempt = 0;
+                    }
+                    TryConnectOutcome::Failed | TryConnectOutcome::MissingData => {
+                        schedule_reconnect(
+                            &mut reconnect_deadline,
+                            &mut reconnect_attempt,
+                            guild_id,
+                            channel_id,
+                            self_mute,
+                            "reconnect_retry",
+                        );
+                    }
+                    TryConnectOutcome::AlreadyConnected => {
+                        reconnect_attempt = 0;
+                    }
+                }
+            }
+
             // ---- 20ms audio send tick ----
             _ = send_interval.tick() => {
                 let now = time::Instant::now();
@@ -2045,7 +949,7 @@ async fn main() {
                                     let guard = audio_send_state.lock();
                                     guard
                                         .as_ref()
-                                        .map_or(true, |state| state.pcm_buffer.is_empty())
+                                        .map_or(true, |state| state.tts_is_empty())
                                 };
                                 let drain_elapsed_ms = music.pending_drain_started_at
                                     .map(|started| now.duration_since(started).as_millis() as u64)
@@ -2085,8 +989,7 @@ async fn main() {
                         {
                             let mut guard = audio_send_state.lock();
                             if let Some(ref mut state) = *guard {
-                                state.music_gain = GainEnvelope::new(0.0, 1.0, 1500);
-                                state.music_gain_notified = 0.0;
+                                state.begin_music_fade_in(1500);
                             }
                         }
 
@@ -2131,11 +1034,7 @@ async fn main() {
                 {
                     let mut guard = audio_send_state.lock();
                     if let Some(ref mut state) = *guard {
-                        if state.music_gain.is_complete()
-                            && (state.music_gain_notified - state.music_gain.target).abs() > 0.0001
-                        {
-                            let reached = state.music_gain.target;
-                            state.music_gain_notified = reached;
+                        if let Some(reached) = state.maybe_take_music_gain_reached() {
                             drop(guard);
                             send_msg(&OutMsg::MusicGainReached { gain: reached });
                         }
@@ -2146,9 +1045,7 @@ async fn main() {
                 if music.pending_stop {
                     let fade_done = {
                         let guard = audio_send_state.lock();
-                        guard.as_ref().map_or(true, |s| {
-                            s.music_gain.is_complete() && s.music_gain.target < 0.001
-                        })
+                        guard.as_ref().map_or(true, |s| s.is_music_fade_out_complete())
                     };
                     if fade_done {
                         music.reset();
@@ -2240,6 +1137,14 @@ async fn main() {
     info!("Shutting down");
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TryConnectOutcome {
+    AlreadyConnected,
+    MissingData,
+    Connected,
+    Failed,
+}
+
 /// Attempt to establish the voice connection once we have all required info.
 async fn try_connect(
     pending: &PendingConnection,
@@ -2248,27 +1153,27 @@ async fn try_connect(
     event_tx: &mpsc::Sender<VoiceEvent>,
     dave: &Arc<Mutex<Option<DaveManager>>>,
     voice_conn: &mut Option<VoiceConnection>,
-) {
+) -> TryConnectOutcome {
     if voice_conn.is_some() {
-        return;
+        return TryConnectOutcome::AlreadyConnected;
     }
     let Some(gid) = guild_id else {
-        return;
+        return TryConnectOutcome::MissingData;
     };
     let Some(cid) = channel_id else {
-        return;
+        return TryConnectOutcome::MissingData;
     };
     let Some(uid) = pending.user_id else {
-        return;
+        return TryConnectOutcome::MissingData;
     };
     let Some(endpoint) = pending.endpoint.as_deref() else {
-        return;
+        return TryConnectOutcome::MissingData;
     };
     let Some(session_id) = pending.session_id.as_deref() else {
-        return;
+        return TryConnectOutcome::MissingData;
     };
     let Some(token) = pending.token.as_deref() else {
-        return;
+        return TryConnectOutcome::MissingData;
     };
 
     info!(
@@ -2290,12 +1195,14 @@ async fn try_connect(
     {
         Ok(conn) => {
             *voice_conn = Some(conn);
+            TryConnectOutcome::Connected
         }
         Err(e) => {
             error!("Voice connection failed: {}", e);
             send_msg(&OutMsg::Error {
                 message: format!("Voice connect failed: {}", e),
             });
+            TryConnectOutcome::Failed
         }
     }
 }
