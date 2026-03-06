@@ -11,10 +11,10 @@ use tracing::{debug, info, warn};
 /// Node version uses 200 to give clients enough time to transition.
 pub const FAILURE_TOLERANCE: u32 = 200;
 
-/// Passthrough expiry (seconds) for pending downgrades (protocol_version → 0).
+/// Passthrough expiry (seconds) for pending downgrades (`protocol_version` → 0).
 const PASSTHROUGH_DOWNGRADE_EXPIRY: u32 = 24;
 
-/// Passthrough expiry (seconds) for upgrades (protocol_version 0 → N).
+/// Passthrough expiry (seconds) for upgrades (`protocol_version` 0 → N).
 const PASSTHROUGH_TRANSITION_EXPIRY: u32 = 10;
 
 /// Maximum seconds to wait for OP22 (Execute Transition) after OP21 prepares a pv=0
@@ -28,7 +28,7 @@ pub struct DaveManager {
     user_id: u64,
     channel_id: u64,
     protocol_version: u16,
-    /// Pending transitions: transition_id → protocol_version.
+    /// Pending transitions: `transition_id` → `protocol_version`.
     /// Populated by OP21 (prepare transition) and OP29/OP30 (commit/welcome).
     /// Consumed by OP22 (execute transition).
     pending_transitions: HashMap<u16, u16>,
@@ -57,7 +57,7 @@ impl DaveManager {
             NonZeroU16::new(protocol_version).context("DAVE protocol version must be non-zero")?;
 
         let mut session = DaveSession::new(pv, user_id, channel_id, None)
-            .map_err(|e| anyhow::anyhow!("DaveSession::new failed: {:?}", e))?;
+            .map_err(|e| anyhow::anyhow!("DaveSession::new failed: {e:?}"))?;
 
         info!(
             "DAVE session created: protocol_version={} user_id={} channel_id={}",
@@ -66,7 +66,7 @@ impl DaveManager {
 
         let pkg = session
             .create_key_package()
-            .map_err(|e| anyhow::anyhow!("create_key_package: {:?}", e))?;
+            .map_err(|e| anyhow::anyhow!("create_key_package: {e:?}"))?;
 
         Ok((
             Self {
@@ -88,7 +88,7 @@ impl DaveManager {
     pub fn set_external_sender(&mut self, data: &[u8]) -> Result<()> {
         self.session
             .set_external_sender(data)
-            .map_err(|e| anyhow::anyhow!("set_external_sender: {:?}", e))?;
+            .map_err(|e| anyhow::anyhow!("set_external_sender: {e:?}"))?;
         debug!("DAVE: external sender set ({} bytes)", data.len());
         Ok(())
     }
@@ -102,7 +102,7 @@ impl DaveManager {
         let result = self
             .session
             .process_proposals(op_type, proposals, user_ids)
-            .map_err(|e| anyhow::anyhow!("process_proposals: {:?}", e))?;
+            .map_err(|e| anyhow::anyhow!("process_proposals: {e:?}"))?;
 
         debug!(
             "DAVE: proposals processed ({} bytes), has_commit={}",
@@ -122,7 +122,7 @@ impl DaveManager {
     pub fn process_welcome(&mut self, data: &[u8]) -> Result<()> {
         self.session
             .process_welcome(data)
-            .map_err(|e| anyhow::anyhow!("process_welcome: {:?}", e))?;
+            .map_err(|e| anyhow::anyhow!("process_welcome: {e:?}"))?;
         self.ready = self.session.is_ready();
         if self.ready {
             info!("DAVE: session ready after welcome");
@@ -133,7 +133,7 @@ impl DaveManager {
     pub fn process_commit(&mut self, data: &[u8]) -> Result<()> {
         self.session
             .process_commit(data)
-            .map_err(|e| anyhow::anyhow!("process_commit: {:?}", e))?;
+            .map_err(|e| anyhow::anyhow!("process_commit: {e:?}"))?;
         self.ready = self.session.is_ready();
         if self.ready {
             info!("DAVE: session ready after commit");
@@ -147,8 +147,8 @@ impl DaveManager {
         }
         self.session
             .encrypt_opus(frame)
-            .map(|cow| cow.into_owned())
-            .map_err(|e| anyhow::anyhow!("encrypt_opus: {:?}", e))
+            .map(std::borrow::Cow::into_owned)
+            .map_err(|e| anyhow::anyhow!("encrypt_opus: {e:?}"))
     }
 
     pub fn decrypt(&mut self, sender_user_id: u64, frame: &[u8]) -> Result<Vec<u8>> {
@@ -200,7 +200,7 @@ impl DaveManager {
                 self.consecutive_failures = 0;
                 Ok(frame.to_vec())
             }
-            Err(e) => Err(anyhow::anyhow!("decrypt: {:?}", e)),
+            Err(e) => Err(anyhow::anyhow!("decrypt: {e:?}")),
         }
     }
 
@@ -309,7 +309,7 @@ impl DaveManager {
     }
 
     /// Reinitialize the DAVE session from scratch. Returns a `RecoveryAction`
-    /// containing the transition_id to invalidate (OP31) and a new key package (OP26).
+    /// containing the `transition_id` to invalidate (OP31) and a new key package (OP26).
     pub fn reinit(&mut self) -> Result<RecoveryAction> {
         let transition_id = self.last_transition_id;
         info!(
@@ -321,13 +321,13 @@ impl DaveManager {
             .context("DAVE protocol version must be non-zero for reinit")?;
 
         let new_session = DaveSession::new(pv, self.user_id, self.channel_id, None)
-            .map_err(|e| anyhow::anyhow!("DaveSession reinit: {:?}", e))?;
+            .map_err(|e| anyhow::anyhow!("DaveSession reinit: {e:?}"))?;
 
         self.session = new_session;
         let pkg = self
             .session
             .create_key_package()
-            .map_err(|e| anyhow::anyhow!("reinit create_key_package: {:?}", e))?;
+            .map_err(|e| anyhow::anyhow!("reinit create_key_package: {e:?}"))?;
 
         self.ready = false;
         self.reinitializing = true;
@@ -348,7 +348,7 @@ impl DaveManager {
 
     /// Check if a pending pv=0 downgrade has timed out waiting for OP22.
     /// If so, auto-execute it so the bot can hear unencrypted audio.
-    /// Returns the transition_id that was auto-executed, if any.
+    /// Returns the `transition_id` that was auto-executed, if any.
     pub fn maybe_auto_execute_downgrade(&mut self) -> Option<u16> {
         let since = self.pending_downgrade_since?;
         if since.elapsed().as_secs() < PENDING_DOWNGRADE_AUTO_EXECUTE_SECS {
@@ -359,7 +359,7 @@ impl DaveManager {
         let tid = self
             .pending_transitions
             .iter()
-            .find(|(_, &pv)| pv == 0)
+            .find(|&(_, &pv)| pv == 0)
             .map(|(&tid, _)| tid);
 
         if let Some(tid) = tid {

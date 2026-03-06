@@ -190,6 +190,7 @@ pub struct VoiceServerData {
 }
 
 #[derive(Deserialize, Debug, Clone)]
+#[allow(clippy::struct_field_names)] // These mirror Discord gateway field names verbatim.
 pub struct VoiceStateData {
     pub session_id: Option<String>,
     pub user_id: Option<String>,
@@ -204,16 +205,63 @@ fn is_lossy_inbound_msg(msg: &InMsg) -> bool {
     matches!(msg, InMsg::Audio { .. })
 }
 
+fn encode_user_audio_payload(
+    user_id: &str,
+    pcm: &[u8],
+    signal_peak_abs: u16,
+    signal_active_sample_count: usize,
+    signal_sample_count: usize,
+) -> Option<Vec<u8>> {
+    let uid = match user_id.parse::<u64>() {
+        Ok(uid) => uid,
+        Err(err) => {
+            warn!(user_id, error = %err, "dropping user audio IPC with non-numeric user id");
+            return None;
+        }
+    };
+
+    let Ok(active_sample_count) = u32::try_from(signal_active_sample_count) else {
+        warn!(
+            user_id,
+            signal_active_sample_count,
+            "dropping user audio IPC with oversized active sample count"
+        );
+        return None;
+    };
+
+    let Ok(sample_count) = u32::try_from(signal_sample_count) else {
+        warn!(
+            user_id,
+            signal_sample_count, "dropping user audio IPC with oversized sample count"
+        );
+        return None;
+    };
+
+    let mut payload = Vec::with_capacity(8 + 2 + 4 + 4 + pcm.len());
+    payload.extend_from_slice(&uid.to_le_bytes());
+    payload.extend_from_slice(&signal_peak_abs.to_le_bytes());
+    payload.extend_from_slice(&active_sample_count.to_le_bytes());
+    payload.extend_from_slice(&sample_count.to_le_bytes());
+    payload.extend_from_slice(pcm);
+    Some(payload)
+}
+
 pub fn send_msg(msg: &OutMsg) {
     if let Some(tx) = IPC_TX.get() {
         if is_lossy_ipc_msg(msg) {
+            // Audio frames are lossy — drop on backpressure rather than blocking.
             if let Err(err) = tx.try_send(msg.clone()) {
                 if !matches!(err, crossbeam::TrySendError::Full(_)) {
                     error!("failed to send lossy IPC message: {}", err);
                 }
             }
-        } else if let Err(err) = tx.send(msg.clone()) {
-            error!("failed to send IPC message: {}", err);
+        } else {
+            // Control messages (Error, ConnectionState, AsrTranscript, etc.) must
+            // not be silently dropped — use blocking send. The bounded channel
+            // (512 slots) provides natural backpressure if the writer thread stalls.
+            if let Err(err) = tx.send(msg.clone()) {
+                error!("failed to send control IPC message: {}", err);
+            }
         }
     }
 }
@@ -297,13 +345,12 @@ pub fn spawn_ipc_reader(
                     if n > MAX_STDIN_LINE_BYTES {
                         if audio_debug {
                             eprintln!(
-                                "[rust-subprocess] Dropping oversized stdin line ({} bytes)",
-                                n
+                                "[rust-subprocess] Dropping oversized stdin line ({n} bytes)"
                             );
                         }
                         try_send_error(
                             ErrorCode::InputTooLarge,
-                            format!("Dropped oversized stdin line ({} bytes)", n),
+                            format!("Dropped oversized stdin line ({n} bytes)"),
                         );
                         continue;
                     }
@@ -325,7 +372,7 @@ pub fn spawn_ipc_reader(
                             }
                             try_send_error(
                                 ErrorCode::InvalidJson,
-                                format!("Invalid stdin JSON message: {}", err),
+                                format!("Invalid stdin JSON message: {err}"),
                             );
                             continue;
                         }
@@ -372,6 +419,10 @@ pub fn spawn_ipc_reader(
 }
 
 pub fn spawn_ipc_writer() -> crossbeam::Sender<OutMsg> {
+    if let Some(tx) = IPC_TX.get() {
+        return tx.clone();
+    }
+
     let (tx, rx) = crossbeam::bounded::<OutMsg>(512);
     std::thread::spawn(move || {
         let mut out = io::stdout().lock();
@@ -384,28 +435,43 @@ pub fn spawn_ipc_writer() -> crossbeam::Sender<OutMsg> {
                     signal_active_sample_count,
                     signal_sample_count,
                 } => {
-                    let uid = user_id.parse::<u64>().unwrap_or(0);
-                    let mut payload = Vec::with_capacity(8 + 2 + 4 + 4 + pcm.len());
-                    payload.extend_from_slice(&uid.to_le_bytes());
-                    payload.extend_from_slice(&signal_peak_abs.to_le_bytes());
-                    payload.extend_from_slice(&(signal_active_sample_count as u32).to_le_bytes());
-                    payload.extend_from_slice(&(signal_sample_count as u32).to_le_bytes());
-                    payload.extend_from_slice(&pcm);
+                    let Some(payload) = encode_user_audio_payload(
+                        &user_id,
+                        &pcm,
+                        signal_peak_abs,
+                        signal_active_sample_count,
+                        signal_sample_count,
+                    ) else {
+                        continue;
+                    };
 
                     let len = payload.len() as u32;
-                    let _ = out.write_all(&[1]);
-                    let _ = out.write_all(&len.to_le_bytes());
-                    let _ = out.write_all(&payload);
-                    let _ = out.flush();
+                    if let Err(e) = out
+                        .write_all(&[1])
+                        .and_then(|()| out.write_all(&len.to_le_bytes()))
+                        .and_then(|()| out.write_all(&payload))
+                        .and_then(|()| out.flush())
+                    {
+                        // Stdout broken — parent process likely exited. Audio frames
+                        // are lossy so we just log once and let the reader thread
+                        // detect stdin EOF to trigger a clean shutdown.
+                        error!("IPC stdout write failed (audio): {e}");
+                        break;
+                    }
                 }
                 other => {
                     if let Ok(json) = serde_json::to_string(&other) {
                         let payload = json.as_bytes();
                         let len = payload.len() as u32;
-                        let _ = out.write_all(&[0]);
-                        let _ = out.write_all(&len.to_le_bytes());
-                        let _ = out.write_all(payload);
-                        let _ = out.flush();
+                        if let Err(e) = out
+                            .write_all(&[0])
+                            .and_then(|()| out.write_all(&len.to_le_bytes()))
+                            .and_then(|()| out.write_all(payload))
+                            .and_then(|()| out.flush())
+                        {
+                            error!("IPC stdout write failed (control): {e}");
+                            break;
+                        }
                     }
                 }
             }
@@ -413,4 +479,25 @@ pub fn spawn_ipc_writer() -> crossbeam::Sender<OutMsg> {
     });
     IPC_TX.set(tx.clone()).expect("IPC_TX already initialized");
     tx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::encode_user_audio_payload;
+
+    #[test]
+    fn encode_user_audio_payload_serializes_header_fields() {
+        let payload = encode_user_audio_payload("42", &[1, 2, 3, 4], 7, 8, 9).expect("payload");
+
+        assert_eq!(&payload[0..8], &42_u64.to_le_bytes());
+        assert_eq!(&payload[8..10], &7_u16.to_le_bytes());
+        assert_eq!(&payload[10..14], &8_u32.to_le_bytes());
+        assert_eq!(&payload[14..18], &9_u32.to_le_bytes());
+        assert_eq!(&payload[18..], &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn encode_user_audio_payload_rejects_non_numeric_user_ids() {
+        assert!(encode_user_audio_payload("not-a-user", &[], 0, 0, 0).is_none());
+    }
 }

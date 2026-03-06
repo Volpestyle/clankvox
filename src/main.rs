@@ -38,9 +38,10 @@ use crate::ipc::{
     spawn_ipc_writer, ErrorCode, InMsg, OutMsg,
 };
 use crate::music::{
-    drain_music_pcm_queue, is_music_output_drained, start_music_pipeline, MusicEvent, MusicState,
+    drain_music_pcm_queue, is_music_output_drained, start_music_pipeline, MusicEvent,
+    MusicPipelineContext, MusicPipelineRequest, MusicState,
 };
-use crate::voice_conn::{VoiceConnection, VoiceEvent};
+use crate::voice_conn::{VoiceConnection, VoiceConnectionParams, VoiceEvent};
 
 fn schedule_reconnect(
     reconnect_deadline: &mut Option<time::Instant>,
@@ -85,15 +86,14 @@ struct PendingConnection {
 }
 
 fn parse_user_id_field(user_id: &str, context: &str) -> Option<u64> {
-    match user_id.parse::<u64>() {
-        Ok(uid) => Some(uid),
-        Err(_) => {
-            send_error(
-                ErrorCode::InvalidRequest,
-                format!("{} requires a numeric user_id, got {:?}", context, user_id),
-            );
-            None
-        }
+    if let Ok(uid) = user_id.parse::<u64>() {
+        Some(uid)
+    } else {
+        send_error(
+            ErrorCode::InvalidRequest,
+            format!("{context} requires a numeric user_id, got {user_id:?}"),
+        );
+        None
     }
 }
 
@@ -102,6 +102,7 @@ fn parse_user_id_field(user_id: &str, context: &str) -> Option<u64> {
 // ---------------------------------------------------------------------------
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)] // Splitting into sub-functions would require passing 15+ mutable refs.
 async fn main() {
     rustls::crypto::ring::default_provider()
         .install_default()
@@ -169,6 +170,7 @@ async fn main() {
     let mut buffer_depth_tick_counter: u32 = 0;
     let mut buffer_depth_was_nonempty = false;
     let mut tts_playback_buffered = false;
+    #[allow(clippy::items_after_statements)]
     const BUFFER_DEPTH_REPORT_INTERVAL: u32 = 25; // 25 × 20ms = 500ms
 
     loop {
@@ -187,25 +189,19 @@ async fn main() {
                 };
                 match msg {
                     InMsg::Join { guild_id: gid, channel_id: cid, _self_deaf: _, self_mute: sm } => {
-                        let g: u64 = match gid.parse() {
-                            Ok(v) => v,
-                            Err(_) => {
-                                send_error(
-                                    ErrorCode::InvalidRequest,
-                                    format!("join requires a numeric guild_id, got {:?}", gid),
-                                );
-                                continue;
-                            }
+                        let Ok(g) = gid.parse::<u64>() else {
+                            send_error(
+                                ErrorCode::InvalidRequest,
+                                format!("join requires a numeric guild_id, got {gid:?}"),
+                            );
+                            continue;
                         };
-                        let c: u64 = match cid.parse() {
-                            Ok(v) => v,
-                            Err(_) => {
-                                send_error(
-                                    ErrorCode::InvalidRequest,
-                                    format!("join requires a numeric channel_id, got {:?}", cid),
-                                );
-                                continue;
-                            }
+                        let Ok(c) = cid.parse::<u64>() else {
+                            send_error(
+                                ErrorCode::InvalidRequest,
+                                format!("join requires a numeric channel_id, got {cid:?}"),
+                            );
+                            continue;
                         };
                         guild_id = Some(g);
                         channel_id = Some(c);
@@ -259,24 +255,24 @@ async fn main() {
                     }
 
                     InMsg::VoiceState { data } => {
-                        let new_sid = data.session_id.clone();
-                        let old_sid = pending_conn.session_id.clone();
-                        let new_uid = match data.user_id.as_deref() {
+                        let new_session_id = data.session_id.clone();
+                        let old_session_id = pending_conn.session_id.clone();
+                        let new_user_id = match data.user_id.as_deref() {
                             Some(user_id) => parse_user_id_field(user_id, "voice_state"),
                             None => None,
                         };
                         let new_channel = data.channel_id.clone();
                         info!(
                             "IPC voice_state: session_id={:?} prev_session_id={:?} channel_id={:?} user_id={:?} connected={}",
-                            new_sid, old_sid, new_channel, new_uid, voice_conn.is_some()
+                            new_session_id, old_session_id, new_channel, new_user_id, voice_conn.is_some()
                         );
 
-                        if let Some(ref sid) = new_sid {
+                        if let Some(ref sid) = new_session_id {
                             // Detect session credential refresh while already connected
-                            if voice_conn.is_some() && old_sid.as_deref() != Some(sid.as_str()) {
+                            if voice_conn.is_some() && old_session_id.as_deref() != Some(sid.as_str()) {
                                 warn!(
                                     "Session ID changed while connected: {:?} -> {:?}, tearing down for reconnect",
-                                    old_sid, new_sid
+                                    old_session_id, new_session_id
                                 );
                                 if let Some(ref conn) = voice_conn {
                                     conn.shutdown();
@@ -286,7 +282,7 @@ async fn main() {
                             }
                             pending_conn.session_id = Some(sid.clone());
                         }
-                        if let Some(uid) = new_uid {
+                        if let Some(uid) = new_user_id {
                             pending_conn.user_id = Some(uid);
                             self_user_id = Some(uid);
                         }
@@ -330,7 +326,7 @@ async fn main() {
                         if music.active && !music.paused {
                             let is_ducked = {
                                 let guard = audio_send_state.lock();
-                                guard.as_ref().map_or(false, |s| s.is_music_ducked())
+                                guard.as_ref().is_some_and(audio_pipeline::AudioSendState::is_music_ducked)
                             };
                             if !is_ducked {
                                 continue;
@@ -425,14 +421,18 @@ async fn main() {
 
                         music.queue_pending_start(normalized_url.clone(), resolved_direct_url);
                         start_music_pipeline(
-                            &normalized_url,
-                            &mut music.player,
-                            &music_pcm_rx,
-                            &music_pcm_tx,
-                            &music_event_tx,
-                            &audio_send_state,
-                            resolved_direct_url,
-                            false,
+                            MusicPipelineRequest {
+                                url: &normalized_url,
+                                resolved_direct_url,
+                                clear_output_buffers: false,
+                            },
+                            MusicPipelineContext {
+                                music_player: &mut music.player,
+                                music_pcm_rx: &music_pcm_rx,
+                                music_pcm_tx: &music_pcm_tx,
+                                music_event_tx: &music_event_tx,
+                                audio_send_state: &audio_send_state,
+                            },
                         );
                         info!(
                             "music_play queued pending start url={} direct={} (waiting for announcement drain)",
@@ -496,14 +496,18 @@ async fn main() {
                             });
                         } else if let Some(url) = music.active_url.clone() {
                             start_music_pipeline(
-                                &url,
-                                &mut music.player,
-                                &music_pcm_rx,
-                                &music_pcm_tx,
-                                &music_event_tx,
-                                &audio_send_state,
-                                music.active_resolved_direct_url,
-                                true,
+                                MusicPipelineRequest {
+                                    url: &url,
+                                    resolved_direct_url: music.active_resolved_direct_url,
+                                    clear_output_buffers: true,
+                                },
+                                MusicPipelineContext {
+                                    music_player: &mut music.player,
+                                    music_pcm_rx: &music_pcm_rx,
+                                    music_pcm_tx: &music_pcm_tx,
+                                    music_event_tx: &music_event_tx,
+                                    audio_send_state: &audio_send_state,
+                                },
                             );
                             music.paused = false;
                             music.active = true;
@@ -541,7 +545,7 @@ async fn main() {
                                 Ok(()) => "closed".to_string(),
                                 Err(e) => {
                                     error!("ASR client {} exited: {}", user_id, e);
-                                    format!("{}", e)
+                                    format!("{e}")
                                 }
                             };
                             let _ = exit_tx.send((uid, reason)).await;
@@ -646,12 +650,9 @@ async fn main() {
                     }
 
                     VoiceEvent::OpusReceived { ssrc, opus_frame } => {
-                        let uid = match ssrc_map.get(&ssrc) {
-                            Some(&uid) => uid,
-                            None => {
-                                debug!("Dropped Opus frame from unknown ssrc: {}", ssrc);
-                                continue;
-                            }
+                        let Some(&uid) = ssrc_map.get(&ssrc) else {
+                            debug!("Dropped Opus frame from unknown ssrc: {ssrc}");
+                            continue;
                         };
                         if self_user_id == Some(uid) {
                             continue; // skip bot's own audio
@@ -838,7 +839,7 @@ async fn main() {
                 });
             }
 
-            _ = async {
+            () = async {
                 if let Some(deadline) = reconnect_deadline {
                     time::sleep_until(deadline).await;
                 } else {
@@ -856,7 +857,7 @@ async fn main() {
                 ).await;
 
                 match outcome {
-                    TryConnectOutcome::Connected => {
+                    TryConnectOutcome::Connected | TryConnectOutcome::AlreadyConnected => {
                         reconnect_attempt = 0;
                     }
                     TryConnectOutcome::Failed | TryConnectOutcome::MissingData => {
@@ -869,9 +870,6 @@ async fn main() {
                             "reconnect_retry",
                         );
                     }
-                    TryConnectOutcome::AlreadyConnected => {
-                        reconnect_attempt = 0;
-                    }
                 }
             }
 
@@ -882,7 +880,7 @@ async fn main() {
                 // Audio-driven speaking timeout: emit SpeakingEnd after SPEAKING_TIMEOUT_MS
                 // of no UDP audio packets from a user.
                 let mut speaking_ended_users: Vec<u64> = Vec::new();
-                for (&user_id, ss) in speaking_states.iter_mut() {
+                for (&user_id, ss) in &mut speaking_states {
                     if !ss.is_speaking {
                         continue;
                     }
@@ -901,7 +899,7 @@ async fn main() {
                 // Emit user_audio_end when we've had enough silence after
                 // speaking/audio updates. This mirrors Node AfterSilence-driven
                 // stream end semantics used by the main-process turn logic.
-                for (user_id, state) in user_capture_states.iter_mut() {
+                for (user_id, state) in &mut user_capture_states {
                     if !state.stream_active {
                         continue;
                     }
@@ -948,11 +946,10 @@ async fn main() {
                                     let guard = audio_send_state.lock();
                                     guard
                                         .as_ref()
-                                        .map_or(true, |state| state.tts_is_empty())
+                                        .is_none_or(audio_pipeline::AudioSendState::tts_is_empty)
                                 };
                                 let drain_elapsed_ms = music.pending_drain_started_at
-                                    .map(|started| now.duration_since(started).as_millis() as u64)
-                                    .unwrap_or(0);
+                                    .map_or(0, |started| now.duration_since(started).as_millis() as u64);
                                 if audio_buffer_empty {
                                     start_music = true;
                                     reason = "pending_announcement_drain_complete";
@@ -970,12 +967,10 @@ async fn main() {
                     if start_music {
                         let total_wait_ms = music
                             .pending_received_at
-                            .map(|received_at| now.duration_since(received_at).as_millis() as u64)
-                            .unwrap_or(0);
+                            .map_or(0, |received_at| now.duration_since(received_at).as_millis() as u64);
                         let prepared_lead_ms = music
                             .pending_first_pcm_at
-                            .map(|first_pcm_at| now.duration_since(first_pcm_at).as_millis() as u64)
-                            .unwrap_or(0);
+                            .map_or(0, |first_pcm_at| now.duration_since(first_pcm_at).as_millis() as u64);
                         let committed_direct_url = music.pending_resolved_direct_url;
                         music.clear_pending_start();
                         music.finishing = false;
@@ -1044,7 +1039,7 @@ async fn main() {
                 if music.pending_stop {
                     let fade_done = {
                         let guard = audio_send_state.lock();
-                        guard.as_ref().map_or(true, |s| s.is_music_fade_out_complete())
+                        guard.as_ref().is_none_or(audio_pipeline::AudioSendState::is_music_fade_out_complete)
                     };
                     if fade_done {
                         music.reset();
@@ -1181,12 +1176,14 @@ async fn try_connect(
     );
 
     match VoiceConnection::connect(
-        endpoint,
-        gid,
-        uid,
-        session_id,
-        token,
-        cid,
+        VoiceConnectionParams {
+            endpoint,
+            guild_id: gid,
+            user_id: uid,
+            session_id,
+            token,
+            channel_id: cid,
+        },
         event_tx.clone(),
         dave.clone(),
     )
@@ -1197,10 +1194,10 @@ async fn try_connect(
             TryConnectOutcome::Connected
         }
         Err(e) => {
-            error!("Voice connection failed: {}", e);
+                        error!("Voice connection failed: {e}");
             send_error(
                 ErrorCode::VoiceConnectFailed,
-                format!("Voice connect failed: {}", e),
+                format!("Voice connect failed: {e}"),
             );
             TryConnectOutcome::Failed
         }

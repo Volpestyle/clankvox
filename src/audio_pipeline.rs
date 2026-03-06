@@ -72,10 +72,12 @@ pub(crate) struct AudioSendState {
 impl AudioSendState {
     pub(crate) fn new() -> Result<Self> {
         let encoder = OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip)
-            .map_err(|e| anyhow::anyhow!("Opus encoder init: {:?}", e))?;
+            .map_err(|e| anyhow::anyhow!("Opus encoder init: {e:?}"))?;
+        // Pre-allocate for ~1 second of audio at 48kHz mono. This avoids
+        // repeated small allocations during the initial buffering phase.
         Ok(Self {
-            pcm_buffer: VecDeque::new(),
-            music_buffer: VecDeque::new(),
+            pcm_buffer: VecDeque::with_capacity(48_000),
+            music_buffer: VecDeque::with_capacity(48_000),
             music_gain: GainEnvelope::new(1.0, 1.0, 0),
             music_gain_notified: 1.0,
             encoder,
@@ -300,7 +302,7 @@ pub(crate) fn convert_llm_to_48k_mono(pcm: &[u8], in_rate: u32) -> Vec<i16> {
 }
 
 /// Convert decoded stereo i16 48kHz to LLM input (mono i16 LE at `out_rate`).
-/// Returns (LLM input, signal_peak_abs, signal_active_sample_count, signal_sample_count)
+/// Returns (LLM input, `signal_peak_abs`, `signal_active_sample_count`, `signal_sample_count`)
 pub(crate) fn convert_decoded_to_llm(
     stereo_i16: &[i16],
     out_rate: u32,

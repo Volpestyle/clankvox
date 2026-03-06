@@ -17,6 +17,26 @@ pub(crate) enum AsrCommand {
     Clear,
 }
 
+fn insert_optional_transcription_field(
+    transcription_cfg: &mut serde_json::Value,
+    key: &str,
+    value: Option<String>,
+) {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return;
+    };
+
+    if let Some(object) = transcription_cfg.as_object_mut() {
+        object.insert(key.to_owned(), json!(value));
+    } else {
+        error!(
+            field = key,
+            "transcription config unexpectedly stopped being an object"
+        );
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn run_asr_client(
     user_id: String,
     api_key: String,
@@ -29,7 +49,7 @@ pub(crate) async fn run_asr_client(
     let mut request = url.into_client_request()?;
     request
         .headers_mut()
-        .insert(AUTHORIZATION, format!("Bearer {}", api_key).parse()?);
+        .insert(AUTHORIZATION, format!("Bearer {api_key}").parse()?);
     request
         .headers_mut()
         .insert("OpenAI-Beta", "realtime=v1".parse()?);
@@ -40,22 +60,8 @@ pub(crate) async fn run_asr_client(
     let mut transcription_cfg = json!({
         "model": model,
     });
-    if let Some(l) = language {
-        if !l.is_empty() {
-            transcription_cfg
-                .as_object_mut()
-                .expect("transcription config should be an object")
-                .insert("language".into(), json!(l));
-        }
-    }
-    if let Some(p) = prompt {
-        if !p.is_empty() {
-            transcription_cfg
-                .as_object_mut()
-                .expect("transcription config should be an object")
-                .insert("prompt".into(), json!(p));
-        }
-    }
+    insert_optional_transcription_field(&mut transcription_cfg, "language", language);
+    insert_optional_transcription_field(&mut transcription_cfg, "prompt", prompt);
 
     let setup_msg = json!({
         "type": "session.update",
@@ -116,10 +122,7 @@ pub(crate) async fn run_asr_client(
                 }
             }
             Some(msg_res) = read.next() => {
-                let msg = match msg_res {
-                    Ok(m) => m,
-                    Err(_) => break,
-                };
+                let Ok(msg) = msg_res else { break };
                 if let Message::Text(text) = msg {
                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
                         let msg_type = value.get("type").and_then(|t| t.as_str()).unwrap_or("");

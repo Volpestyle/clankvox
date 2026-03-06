@@ -1,7 +1,24 @@
 [package]
 name = "clankvox"
-version = "0.2.0"
-edition = "2021"
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.85"
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Allow these common pedantic lints that are noisy in real-time audio code
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+cast_lossless = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
 
 [dependencies]
 tokio = { version = "1", features = ["full", "rt-multi-thread"] }
