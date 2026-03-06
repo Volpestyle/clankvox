@@ -352,7 +352,14 @@ async fn run_asr_client(
                     "noise_reduction": {
                         "type": "near_field"
                     },
-                    "turn_detection": serde_json::Value::Null,
+                    "turn_detection": {
+                        "type": "server_vad",
+                        "threshold": 0.55,
+                        "prefix_padding_ms": 240,
+                        "silence_duration_ms": 450,
+                        "create_response": false,
+                        "interrupt_response": false
+                    },
                     "transcription": transcription_cfg
                 }
             }
