@@ -1,10 +1,9 @@
-#![allow(dead_code)]
-
 mod dave;
 mod voice_conn;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{hash_map::Entry, HashMap, VecDeque};
 use std::io::{self, BufRead, Write};
+use std::os::unix::process::CommandExt;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -47,15 +46,15 @@ enum InMsg {
         #[serde(rename = "channelId")]
         channel_id: String,
         #[serde(rename = "selfDeaf", default)]
-        self_deaf: bool,
+        _self_deaf: bool,
         #[serde(rename = "selfMute", default)]
         self_mute: bool,
     },
     VoiceServer {
-        data: Value,
+        data: VoiceServerData,
     },
     VoiceState {
-        data: Value,
+        data: VoiceStateData,
     },
     Audio {
         #[serde(rename = "pcmBase64")]
@@ -199,9 +198,34 @@ enum OutMsg {
     },
 }
 
+#[derive(Deserialize, Debug, Clone)]
+struct VoiceServerData {
+    endpoint: Option<String>,
+    token: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct VoiceStateData {
+    session_id: Option<String>,
+    user_id: Option<String>,
+    channel_id: Option<String>,
+}
+
+fn is_lossy_ipc_msg(msg: &OutMsg) -> bool {
+    matches!(msg, OutMsg::UserAudio { .. })
+}
+
 fn send_msg(msg: &OutMsg) {
     if let Some(tx) = IPC_TX.get() {
-        let _ = tx.try_send(msg.clone());
+        if is_lossy_ipc_msg(msg) {
+            if let Err(err) = tx.try_send(msg.clone()) {
+                if !matches!(err, crossbeam::TrySendError::Full(_)) {
+                    error!("failed to send lossy IPC message: {}", err);
+                }
+            }
+        } else if let Err(err) = tx.send(msg.clone()) {
+            error!("failed to send IPC message: {}", err);
+        }
     }
 }
 
@@ -512,7 +536,9 @@ mod tests {
         assert!(state.next_opus_frame().is_none());
         state.push_pcm(vec![123; 480]);
 
-        let frame = state.next_opus_frame().expect("full frame should encode once tail grows");
+        let frame = state
+            .next_opus_frame()
+            .expect("full frame should encode once tail grows");
         assert!(!frame.is_empty());
         assert_eq!(state.tts_buffer_samples(), 0);
     }
@@ -596,15 +622,6 @@ struct PendingConnection {
     token: Option<String>,
     session_id: Option<String>,
     user_id: Option<u64>,
-}
-
-impl PendingConnection {
-    fn is_complete(&self) -> bool {
-        self.endpoint.is_some()
-            && self.token.is_some()
-            && self.session_id.is_some()
-            && self.user_id.is_some()
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -757,9 +774,8 @@ impl AudioSendState {
             self.partial_tts_stall_ticks = 0;
         }
 
-        let flush_partial_tts =
-            has_partial_tts &&
-            (has_music || self.partial_tts_stall_ticks >= PARTIAL_TTS_FLUSH_TICKS);
+        let flush_partial_tts = has_partial_tts
+            && (has_music || self.partial_tts_stall_ticks >= PARTIAL_TTS_FLUSH_TICKS);
         let tts_samples_to_take = if has_full_tts {
             FRAME_SIZE
         } else if flush_partial_tts {
@@ -961,6 +977,21 @@ struct MusicPlayer {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
+fn kill_music_process_group(pid: u32, signal: libc::c_int) {
+    if pid == 0 {
+        return;
+    }
+    // SAFETY: `pid` comes from `std::process::Child::id()` and we place the child
+    // shell in its own process group before spawn, so signaling that group is valid.
+    unsafe {
+        libc::killpg(pid as libc::pid_t, signal);
+    }
+}
+
+fn terminate_music_child(child: &mut std::process::Child, signal: libc::c_int) {
+    kill_music_process_group(child.id(), signal);
+}
+
 impl MusicPlayer {
     fn start(
         url: &str,
@@ -978,6 +1009,7 @@ impl MusicPlayer {
             let pipeline_command = build_music_pipeline_command(&url, resolved_direct_url);
             let pipeline_started_at = time::Instant::now();
             let child = std::process::Command::new("sh")
+                .process_group(0)
                 .args(["-c", &pipeline_command])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -1023,7 +1055,7 @@ impl MusicPlayer {
                     let _ = music_event_tx.blocking_send(MusicEvent::Error(
                         "music pipeline missing stdout".to_string(),
                     ));
-                    let _ = child.kill();
+                    terminate_music_child(&mut child, libc::SIGTERM);
                     let _ = child.wait();
                     if let Some(handle) = stderr_thread.take() {
                         let _ = handle.join();
@@ -1067,7 +1099,7 @@ impl MusicPlayer {
                 }
             }
 
-            let _ = child.kill();
+            terminate_music_child(&mut child, libc::SIGTERM);
             let wait_result = child.wait();
             if let Some(handle) = stderr_thread.take() {
                 let _ = handle.join();
@@ -1117,12 +1149,7 @@ impl MusicPlayer {
     fn stop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         let pid = self.child_pid.load(Ordering::SeqCst);
-        if pid > 0 {
-            // Direct syscall instead of spawning a process
-            unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGTERM);
-            }
-        }
+        kill_music_process_group(pid, libc::SIGTERM);
         self.child_pid.store(0, Ordering::SeqCst);
         if let Some(thread) = self.thread.take() {
             if thread.is_finished() {
@@ -1140,6 +1167,74 @@ impl MusicPlayer {
 impl Drop for MusicPlayer {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[derive(Default)]
+struct MusicState {
+    player: Option<MusicPlayer>,
+    active: bool,
+    paused: bool,
+    finishing: bool,
+    active_url: Option<String>,
+    active_resolved_direct_url: bool,
+    pending_url: Option<String>,
+    pending_received_at: Option<time::Instant>,
+    pending_audio_seen: bool,
+    pending_last_audio_at: Option<time::Instant>,
+    pending_waiting_for_drain: bool,
+    pending_drain_started_at: Option<time::Instant>,
+    pending_first_pcm_at: Option<time::Instant>,
+    pending_resolved_direct_url: bool,
+    pending_stop: bool,
+}
+
+impl MusicState {
+    fn stop_player(&mut self) {
+        if let Some(ref mut player) = self.player {
+            player.stop();
+        }
+        self.player = None;
+    }
+
+    fn clear_pending_start(&mut self) {
+        self.pending_url = None;
+        self.pending_received_at = None;
+        self.pending_audio_seen = false;
+        self.pending_last_audio_at = None;
+        self.pending_waiting_for_drain = false;
+        self.pending_drain_started_at = None;
+        self.pending_first_pcm_at = None;
+        self.pending_resolved_direct_url = false;
+    }
+
+    fn reset(&mut self) {
+        self.stop_player();
+        self.active = false;
+        self.paused = false;
+        self.finishing = false;
+        self.active_url = None;
+        self.active_resolved_direct_url = false;
+        self.pending_stop = false;
+        self.clear_pending_start();
+    }
+
+    fn queue_pending_start(&mut self, url: String, resolved_direct_url: bool) {
+        self.stop_player();
+        self.active = false;
+        self.paused = false;
+        self.finishing = false;
+        self.pending_stop = false;
+        self.active_url = Some(url.clone());
+        self.active_resolved_direct_url = resolved_direct_url;
+        self.pending_url = Some(url);
+        self.pending_received_at = Some(time::Instant::now());
+        self.pending_audio_seen = false;
+        self.pending_last_audio_at = None;
+        self.pending_waiting_for_drain = false;
+        self.pending_drain_started_at = None;
+        self.pending_first_pcm_at = None;
+        self.pending_resolved_direct_url = resolved_direct_url;
     }
 }
 
@@ -1256,25 +1351,10 @@ async fn main() {
     // Music → PCM channel (feeds into audio_send_state)
     let (music_pcm_tx, music_pcm_rx) = crossbeam::bounded::<Vec<i16>>(500);
     let (music_event_tx, mut music_event_rx) = mpsc::channel::<MusicEvent>(32);
-    let mut music_player: Option<MusicPlayer> = None;
-    let mut music_active = false;
-    let mut music_paused = false;
-    let mut active_music_url: Option<String> = None;
-    let mut active_music_resolved_direct_url = false;
-    let mut pending_music_url: Option<String> = None;
-    let mut pending_music_received_at: Option<time::Instant> = None;
-    let mut pending_music_audio_seen = false;
-    let mut pending_music_last_audio_at: Option<time::Instant> = None;
-    let mut pending_music_waiting_for_drain = false;
-    let mut pending_music_drain_started_at: Option<time::Instant> = None;
-    let mut pending_music_first_pcm_at: Option<time::Instant> = None;
-    let mut pending_music_resolved_direct_url = false;
-    let mut pending_music_stop = false; // Set when fade-out starts before actual stop
-    let mut music_finishing = false;
+    let mut music = MusicState::default();
 
-    // Opus decoder for inbound audio (stereo 48kHz)
-    let mut opus_decoder =
-        OpusDecoder::new(SampleRate::Hz48000, Channels::Stereo).expect("Opus decoder init");
+    // Per-SSRC Opus decoders for inbound stereo 48kHz user audio.
+    let mut opus_decoders: HashMap<u32, OpusDecoder> = HashMap::new();
 
     // SSRC → user_id mapping (mirrored from voice_conn's Speaking events)
     let mut ssrc_map: HashMap<u32, u64> = HashMap::new();
@@ -1299,7 +1379,7 @@ async fn main() {
             // ---- IPC message from main process ----
             Some(msg) = ipc_msg_rx.recv() => {
                 match msg {
-                    InMsg::Join { guild_id: gid, channel_id: cid, self_deaf: _, self_mute: sm } => {
+                    InMsg::Join { guild_id: gid, channel_id: cid, _self_deaf: _, self_mute: sm } => {
                         let g: u64 = match gid.parse() {
                             Ok(v) => v,
                             Err(_) => { send_error("Invalid guild ID"); continue; }
@@ -1328,8 +1408,8 @@ async fn main() {
                     }
 
                     InMsg::VoiceServer { data } => {
-                        let ep = data.get("endpoint").and_then(|v| v.as_str()).map(String::from);
-                        let has_token = data.get("token").and_then(|v| v.as_str()).is_some();
+                        let ep = data.endpoint.clone();
+                        let has_token = data.token.is_some();
                         info!(
                             "IPC voice_server: endpoint={:?} token={} connected={}",
                             ep, if has_token { "present" } else { "missing" }, voice_conn.is_some()
@@ -1337,20 +1417,24 @@ async fn main() {
                         if let Some(ref e) = ep {
                             pending_conn.endpoint = Some(e.clone());
                         }
-                        if let Some(tk) = data.get("token").and_then(|v| v.as_str()) {
+                        if let Some(tk) = data.token.as_deref() {
                             pending_conn.token = Some(tk.to_string());
                         }
                         try_connect(
-                            &pending_conn, guild_id, channel_id, self_user_id,
-                            &voice_event_tx, &dave, &mut voice_conn, &audio_send_state,
+                            &pending_conn,
+                            guild_id,
+                            channel_id,
+                            &voice_event_tx,
+                            &dave,
+                            &mut voice_conn,
                         ).await;
                     }
 
                     InMsg::VoiceState { data } => {
-                        let new_sid = data.get("session_id").and_then(|v| v.as_str()).map(String::from);
+                        let new_sid = data.session_id.clone();
                         let old_sid = pending_conn.session_id.clone();
-                        let new_uid = data.get("user_id").and_then(|v| v.as_str()).and_then(|s| s.parse::<u64>().ok());
-                        let new_channel = data.get("channel_id").and_then(|v| v.as_str()).map(String::from);
+                        let new_uid = data.user_id.as_deref().and_then(|s| s.parse::<u64>().ok());
+                        let new_channel = data.channel_id.clone();
                         info!(
                             "IPC voice_state: session_id={:?} prev_session_id={:?} channel_id={:?} user_id={:?} connected={}",
                             new_sid, old_sid, new_channel, new_uid, voice_conn.is_some()
@@ -1376,21 +1460,25 @@ async fn main() {
                             self_user_id = Some(uid);
                         }
                         try_connect(
-                            &pending_conn, guild_id, channel_id, self_user_id,
-                            &voice_event_tx, &dave, &mut voice_conn, &audio_send_state,
+                            &pending_conn,
+                            guild_id,
+                            channel_id,
+                            &voice_event_tx,
+                            &dave,
+                            &mut voice_conn,
                         ).await;
                     }
 
                     InMsg::Audio { pcm_base64, sample_rate } => {
                         let now = time::Instant::now();
-                        if pending_music_url.is_some() {
-                            pending_music_audio_seen = true;
-                            pending_music_last_audio_at = Some(now);
+                        if music.pending_url.is_some() {
+                            music.pending_audio_seen = true;
+                            music.pending_last_audio_at = Some(now);
                         }
 
                         // When music is playing at full volume (not ducked), drop TTS.
                         // When music is ducked (gain < 1.0), allow TTS through for mixing.
-                        if music_active && !music_paused {
+                        if music.active && !music.paused {
                             let is_ducked = {
                                 let guard = audio_send_state.lock();
                                 guard.as_ref().map_or(false, |s| s.music_gain.target < 1.0)
@@ -1423,22 +1511,7 @@ async fn main() {
                     }
 
                     InMsg::StopPlayback => {
-                        if let Some(ref mut mp) = music_player {
-                            mp.stop();
-                        }
-                        music_player = None;
-                        music_active = false;
-                        music_paused = false;
-                        active_music_url = None;
-                        active_music_resolved_direct_url = false;
-                        pending_music_url = None;
-                        pending_music_received_at = None;
-                        pending_music_audio_seen = false;
-                        pending_music_last_audio_at = None;
-                        pending_music_waiting_for_drain = false;
-                        pending_music_drain_started_at = None;
-                        pending_music_first_pcm_at = None;
-                        pending_music_resolved_direct_url = false;
+                        music.reset();
                         drain_music_pcm_queue(&music_pcm_rx);
                         clear_audio_send_buffer(&audio_send_state);
                         if tts_playback_buffered {
@@ -1499,26 +1572,10 @@ async fn main() {
                             continue;
                         }
 
-                        if let Some(ref mut mp) = music_player {
-                            mp.stop();
-                        }
-                        music_player = None;
-                        music_active = false;
-                        music_paused = false;
-                        active_music_url = Some(normalized_url.clone());
-                        active_music_resolved_direct_url = resolved_direct_url;
-                        pending_music_url = Some(normalized_url.clone());
-                        pending_music_received_at = Some(time::Instant::now());
-                        pending_music_audio_seen = false;
-                        pending_music_last_audio_at = None;
-                        pending_music_waiting_for_drain = false;
-                        pending_music_drain_started_at = None;
-                        pending_music_first_pcm_at = None;
-                        pending_music_resolved_direct_url = resolved_direct_url;
-                        music_finishing = false;
+                        music.queue_pending_start(normalized_url.clone(), resolved_direct_url);
                         start_music_pipeline(
                             &normalized_url,
-                            &mut music_player,
+                            &mut music.player,
                             &music_pcm_rx,
                             &music_pcm_tx,
                             &music_event_tx,
@@ -1534,33 +1591,17 @@ async fn main() {
                     }
 
                     InMsg::MusicStop => {
-                        if music_player.is_some() && music_active {
+                        if music.player.is_some() && music.active {
                             // Start a quick fade-out; actual stop happens in the
                             // 20ms tick when the fade completes.
                             let mut guard = audio_send_state.lock();
                             if let Some(ref mut state) = *guard {
                                 state.set_music_gain(0.0, 300);
                             }
-                            pending_music_stop = true;
+                            music.pending_stop = true;
                         } else {
                             // No active music, stop immediately
-                            if let Some(ref mut mp) = music_player {
-                                mp.stop();
-                            }
-                            music_player = None;
-                            music_active = false;
-                            music_paused = false;
-                            active_music_url = None;
-                            active_music_resolved_direct_url = false;
-                            pending_music_url = None;
-                            pending_music_received_at = None;
-                            pending_music_audio_seen = false;
-                            pending_music_last_audio_at = None;
-                            pending_music_waiting_for_drain = false;
-                            pending_music_drain_started_at = None;
-                            pending_music_first_pcm_at = None;
-                            pending_music_resolved_direct_url = false;
-                            music_finishing = false;
+                            music.reset();
                             drain_music_pcm_queue(&music_pcm_rx);
                             clear_audio_send_buffer(&audio_send_state);
                             if tts_playback_buffered {
@@ -1576,19 +1617,13 @@ async fn main() {
                     }
 
                     InMsg::MusicPause => {
-                        pending_music_url = None;
-                        pending_music_received_at = None;
-                        pending_music_audio_seen = false;
-                        pending_music_last_audio_at = None;
-                        pending_music_waiting_for_drain = false;
-                        pending_music_drain_started_at = None;
-                        pending_music_first_pcm_at = None;
-                        pending_music_resolved_direct_url = false;
-                        let was_finishing = music_finishing;
-                        music_finishing = false;
-                        if music_player.is_some() || music_active || was_finishing {
-                            music_paused = true;
-                            music_active = false;
+                        music.clear_pending_start();
+                        music.pending_stop = false;
+                        let was_finishing = music.finishing;
+                        music.finishing = false;
+                        if music.player.is_some() || music.active || was_finishing {
+                            music.paused = true;
+                            music.active = false;
                             clear_audio_send_buffer(&audio_send_state);
                             send_msg(&OutMsg::PlayerState {
                                 status: "paused".into(),
@@ -1598,35 +1633,29 @@ async fn main() {
                     }
 
                     InMsg::MusicResume => {
-                        pending_music_url = None;
-                        pending_music_received_at = None;
-                        pending_music_audio_seen = false;
-                        pending_music_last_audio_at = None;
-                        pending_music_waiting_for_drain = false;
-                        pending_music_drain_started_at = None;
-                        pending_music_first_pcm_at = None;
-                        pending_music_resolved_direct_url = false;
-                        music_finishing = false;
+                        music.clear_pending_start();
+                        music.pending_stop = false;
+                        music.finishing = false;
 
-                        if music_player.is_some() {
-                            music_paused = false;
-                            music_active = true;
+                        if music.player.is_some() {
+                            music.paused = false;
+                            music.active = true;
                             send_msg(&OutMsg::PlayerState {
                                 status: "playing".into(),
                             });
-                        } else if let Some(url) = active_music_url.clone() {
+                        } else if let Some(url) = music.active_url.clone() {
                             start_music_pipeline(
                                 &url,
-                                &mut music_player,
+                                &mut music.player,
                                 &music_pcm_rx,
                                 &music_pcm_tx,
                                 &music_event_tx,
                                 &audio_send_state,
-                                active_music_resolved_direct_url,
+                                music.active_resolved_direct_url,
                                 true,
                             );
-                            music_paused = false;
-                            music_active = true;
+                            music.paused = false;
+                            music.active = true;
                             send_msg(&OutMsg::PlayerState {
                                 status: "playing".into(),
                             });
@@ -1689,9 +1718,7 @@ async fn main() {
                     }
 
                     InMsg::Destroy => {
-                        if let Some(ref mut mp) = music_player {
-                            mp.stop();
-                        }
+                        music.stop_player();
                         if let Some(ref conn) = voice_conn {
                             conn.shutdown();
                         }
@@ -1719,7 +1746,9 @@ async fn main() {
                     }
 
                     VoiceEvent::SsrcUpdate { ssrc, user_id } => {
-                        ssrc_map.insert(ssrc, user_id);
+                        if ssrc_map.insert(ssrc, user_id) != Some(user_id) {
+                            opus_decoders.remove(&ssrc);
+                        }
                     }
 
                     VoiceEvent::ClientDisconnect { user_id } => {
@@ -1727,7 +1756,14 @@ async fn main() {
                             continue;
                         }
                         // Remove from SSRC map
+                        let removed_ssrcs = ssrc_map
+                            .iter()
+                            .filter_map(|(&ssrc, &mapped_uid)| (mapped_uid == user_id).then_some(ssrc))
+                            .collect::<Vec<_>>();
                         ssrc_map.retain(|_, v| *v != user_id);
+                        for ssrc in removed_ssrcs {
+                            opus_decoders.remove(&ssrc);
+                        }
 
                         let uid_str = user_id.to_string();
 
@@ -1775,11 +1811,29 @@ async fn main() {
 
                         // Opus decode → stereo i16 48kHz
                         let mut pcm_stereo = vec![0i16; 5760]; // max Opus frame
+                        if let Entry::Vacant(entry) = opus_decoders.entry(ssrc) {
+                            let decoder =
+                                match OpusDecoder::new(SampleRate::Hz48000, Channels::Stereo) {
+                                    Ok(decoder) => decoder,
+                                    Err(error) => {
+                                        error!(
+                                            "failed to init Opus decoder for ssrc={}: {:?}",
+                                            ssrc, error
+                                        );
+                                        continue;
+                                    }
+                                };
+                            entry.insert(decoder);
+                        }
+
                         let decode_result = {
                             let packet = OpusPacket::try_from(opus_frame.as_slice()).ok();
                             let signals = MutSignals::try_from(pcm_stereo.as_mut_slice())
                                 .expect("non-empty signal buffer");
-                            opus_decoder.decode(packet, signals, false)
+                            opus_decoders
+                                .get_mut(&ssrc)
+                                .expect("decoder inserted above")
+                                .decode(packet, signals, false)
                         };
                         match decode_result {
                             Ok(samples_per_channel) => {
@@ -1833,25 +1887,12 @@ async fn main() {
                     VoiceEvent::Disconnected { reason } => {
                         warn!("Voice disconnected: {}", reason);
                         send_msg(&OutMsg::ConnectionState { status: "disconnected".into() });
-                        if let Some(ref mut mp) = music_player {
-                            mp.stop();
-                        }
-                        music_player = None;
-                        music_active = false;
-                        music_paused = false;
-                        active_music_url = None;
-                        active_music_resolved_direct_url = false;
-                        pending_music_url = None;
-                        pending_music_received_at = None;
-                        pending_music_audio_seen = false;
-                        pending_music_last_audio_at = None;
-                        pending_music_waiting_for_drain = false;
-                        pending_music_drain_started_at = None;
-                        pending_music_first_pcm_at = None;
-                        pending_music_resolved_direct_url = false;
+                        music.reset();
                         drain_music_pcm_queue(&music_pcm_rx);
                         voice_conn = None;
                         *audio_send_state.lock() = None;
+                        ssrc_map.clear();
+                        opus_decoders.clear();
                         speaking_states.clear();
                     }
 
@@ -1866,23 +1907,14 @@ async fn main() {
             Some(event) = music_event_rx.recv() => {
                 match event {
                     MusicEvent::Idle => {
-                        if let Some(ref mut mp) = music_player {
-                            mp.stop();
-                        }
-                        music_player = None;
-                        music_paused = false;
-                        music_finishing = music_active;
-                        pending_music_url = None;
-                        pending_music_received_at = None;
-                        pending_music_audio_seen = false;
-                        pending_music_last_audio_at = None;
-                        pending_music_waiting_for_drain = false;
-                        pending_music_drain_started_at = None;
-                        pending_music_first_pcm_at = None;
-                        pending_music_resolved_direct_url = false;
-                        if !music_finishing {
-                            active_music_url = None;
-                            active_music_resolved_direct_url = false;
+                        music.stop_player();
+                        music.paused = false;
+                        music.finishing = music.active;
+                        music.pending_stop = false;
+                        music.clear_pending_start();
+                        if !music.finishing {
+                            music.active_url = None;
+                            music.active_resolved_direct_url = false;
                             send_msg(&OutMsg::PlayerState {
                                 status: "idle".into(),
                             });
@@ -1891,23 +1923,7 @@ async fn main() {
                         }
                     }
                     MusicEvent::Error(message) => {
-                        if let Some(ref mut mp) = music_player {
-                            mp.stop();
-                        }
-                        music_player = None;
-                        music_active = false;
-                        music_paused = false;
-                        music_finishing = false;
-                        active_music_url = None;
-                        active_music_resolved_direct_url = false;
-                        pending_music_url = None;
-                        pending_music_received_at = None;
-                        pending_music_audio_seen = false;
-                        pending_music_last_audio_at = None;
-                        pending_music_waiting_for_drain = false;
-                        pending_music_drain_started_at = None;
-                        pending_music_first_pcm_at = None;
-                        pending_music_resolved_direct_url = false;
+                        music.reset();
                         drain_music_pcm_queue(&music_pcm_rx);
                         send_msg(&OutMsg::MusicError { message });
                         send_msg(&OutMsg::PlayerState {
@@ -1920,11 +1936,11 @@ async fn main() {
                         resolved_direct_url,
                     } => {
                         let now = time::Instant::now();
-                        pending_music_first_pcm_at = Some(now);
-                        if let Some(received_at) = pending_music_received_at {
+                        music.pending_first_pcm_at = Some(now);
+                        if let Some(received_at) = music.pending_received_at {
                             info!(
                                 "music_play prepared url={} direct={} startupMs={} requestToFirstPcmMs={}",
-                                pending_music_url.as_deref().unwrap_or("unknown"),
+                                music.pending_url.as_deref().unwrap_or("unknown"),
                                 resolved_direct_url,
                                 startup_ms,
                                 now.duration_since(received_at).as_millis() as u64
@@ -1932,7 +1948,7 @@ async fn main() {
                         } else {
                             info!(
                                 "music_play prepared url={} direct={} startupMs={}",
-                                pending_music_url.as_deref().unwrap_or("unknown"),
+                                music.pending_url.as_deref().unwrap_or("unknown"),
                                 resolved_direct_url,
                                 startup_ms
                             );
@@ -2003,34 +2019,35 @@ async fn main() {
 
                 // Deferred music start: allow announcement audio to complete
                 // before we commit the music pipeline.
-                if let Some(url) = pending_music_url.clone() {
+                if let Some(url) = music.pending_url.clone() {
                     let mut start_music = false;
                     let mut reason = "pending_unknown";
-                    if let Some(received_at) = pending_music_received_at {
+                    if let Some(received_at) = music.pending_received_at {
                         let elapsed_ms = now.duration_since(received_at).as_millis() as u64;
                         if elapsed_ms > 15_000 {
                             start_music = true;
                             reason = "pending_safety_timeout";
-                        } else if !pending_music_audio_seen {
+                        } else if !music.pending_audio_seen {
                             if elapsed_ms > 5_000 {
                                 start_music = true;
                                 reason = "pending_no_announcement_audio";
                             }
                         } else {
-                            let last_audio_at = pending_music_last_audio_at.unwrap_or(received_at);
+                            let last_audio_at =
+                                music.pending_last_audio_at.unwrap_or(received_at);
                             let gap_ms = now.duration_since(last_audio_at).as_millis() as u64;
-                            if !pending_music_waiting_for_drain && gap_ms > 500 {
-                                pending_music_waiting_for_drain = true;
-                                pending_music_drain_started_at = Some(now);
+                            if !music.pending_waiting_for_drain && gap_ms > 500 {
+                                music.pending_waiting_for_drain = true;
+                                music.pending_drain_started_at = Some(now);
                             }
-                            if pending_music_waiting_for_drain {
+                            if music.pending_waiting_for_drain {
                                 let audio_buffer_empty = {
                                     let guard = audio_send_state.lock();
                                     guard
                                         .as_ref()
                                         .map_or(true, |state| state.pcm_buffer.is_empty())
                                 };
-                                let drain_elapsed_ms = pending_music_drain_started_at
+                                let drain_elapsed_ms = music.pending_drain_started_at
                                     .map(|started| now.duration_since(started).as_millis() as u64)
                                     .unwrap_or(0);
                                 if audio_buffer_empty {
@@ -2048,26 +2065,21 @@ async fn main() {
                     }
 
                     if start_music {
-                        let total_wait_ms = pending_music_received_at
+                        let total_wait_ms = music
+                            .pending_received_at
                             .map(|received_at| now.duration_since(received_at).as_millis() as u64)
                             .unwrap_or(0);
-                        let prepared_lead_ms = pending_music_first_pcm_at
+                        let prepared_lead_ms = music
+                            .pending_first_pcm_at
                             .map(|first_pcm_at| now.duration_since(first_pcm_at).as_millis() as u64)
                             .unwrap_or(0);
-                        let committed_direct_url = pending_music_resolved_direct_url;
-                        pending_music_url = None;
-                        pending_music_received_at = None;
-                        pending_music_audio_seen = false;
-                        pending_music_last_audio_at = None;
-                        pending_music_waiting_for_drain = false;
-                        pending_music_drain_started_at = None;
-                        pending_music_first_pcm_at = None;
-                        pending_music_resolved_direct_url = false;
-                        music_finishing = false;
-                        active_music_url = Some(url.clone());
-                        active_music_resolved_direct_url = committed_direct_url;
-                        music_active = true;
-                        music_paused = false;
+                        let committed_direct_url = music.pending_resolved_direct_url;
+                        music.clear_pending_start();
+                        music.finishing = false;
+                        music.active_url = Some(url.clone());
+                        music.active_resolved_direct_url = committed_direct_url;
+                        music.active = true;
+                        music.paused = false;
 
                         // Fade in over 1.5s
                         {
@@ -2093,7 +2105,7 @@ async fn main() {
                 }
 
                 // Drain music PCM into the dedicated music buffer only while active.
-                if music_active && !music_paused {
+                if music.active && !music.paused {
                     while let Ok(chunk) = music_pcm_rx.try_recv() {
                         let mut guard = audio_send_state.lock();
                         if let Some(ref mut state) = *guard {
@@ -2102,11 +2114,12 @@ async fn main() {
                     }
                 }
 
-                if music_finishing && is_music_output_drained(&music_pcm_rx, &audio_send_state) {
-                    music_finishing = false;
-                    music_active = false;
-                    music_paused = false;
-                    active_music_url = None;
+                if music.finishing && is_music_output_drained(&music_pcm_rx, &audio_send_state) {
+                    music.finishing = false;
+                    music.active = false;
+                    music.paused = false;
+                    music.active_url = None;
+                    music.active_resolved_direct_url = false;
                     send_msg(&OutMsg::PlayerState {
                         status: "idle".into(),
                     });
@@ -2130,7 +2143,7 @@ async fn main() {
                 }
 
                 // Deferred music stop: execute after fade-out completes.
-                if pending_music_stop {
+                if music.pending_stop {
                     let fade_done = {
                         let guard = audio_send_state.lock();
                         guard.as_ref().map_or(true, |s| {
@@ -2138,24 +2151,7 @@ async fn main() {
                         })
                     };
                     if fade_done {
-                        pending_music_stop = false;
-                        if let Some(ref mut mp) = music_player {
-                            mp.stop();
-                        }
-                        music_player = None;
-                        music_active = false;
-                        music_paused = false;
-                        music_finishing = false;
-                        active_music_url = None;
-                        active_music_resolved_direct_url = false;
-                        pending_music_url = None;
-                        pending_music_received_at = None;
-                        pending_music_audio_seen = false;
-                        pending_music_last_audio_at = None;
-                        pending_music_waiting_for_drain = false;
-                        pending_music_drain_started_at = None;
-                        pending_music_first_pcm_at = None;
-                        pending_music_resolved_direct_url = false;
+                        music.reset();
                         drain_music_pcm_queue(&music_pcm_rx);
                         clear_audio_send_buffer(&audio_send_state);
                         if tts_playback_buffered {
@@ -2245,29 +2241,35 @@ async fn main() {
 }
 
 /// Attempt to establish the voice connection once we have all required info.
-#[allow(clippy::too_many_arguments)]
 async fn try_connect(
     pending: &PendingConnection,
     guild_id: Option<u64>,
     channel_id: Option<u64>,
-    _self_user_id: Option<u64>,
     event_tx: &mpsc::Sender<VoiceEvent>,
     dave: &Arc<Mutex<Option<DaveManager>>>,
     voice_conn: &mut Option<VoiceConnection>,
-    _audio_send_state: &Arc<Mutex<Option<AudioSendState>>>,
 ) {
-    if voice_conn.is_some() || !pending.is_complete() {
+    if voice_conn.is_some() {
         return;
     }
-    let gid = match guild_id {
-        Some(g) => g,
-        None => return,
+    let Some(gid) = guild_id else {
+        return;
     };
-    let cid = match channel_id {
-        Some(c) => c,
-        None => return,
+    let Some(cid) = channel_id else {
+        return;
     };
-    let uid = pending.user_id.unwrap();
+    let Some(uid) = pending.user_id else {
+        return;
+    };
+    let Some(endpoint) = pending.endpoint.as_deref() else {
+        return;
+    };
+    let Some(session_id) = pending.session_id.as_deref() else {
+        return;
+    };
+    let Some(token) = pending.token.as_deref() else {
+        return;
+    };
 
     info!(
         "Connecting to voice: endpoint={:?} guild={} channel={} user={}",
@@ -2275,11 +2277,11 @@ async fn try_connect(
     );
 
     match VoiceConnection::connect(
-        pending.endpoint.as_ref().unwrap(),
+        endpoint,
         gid,
         uid,
-        pending.session_id.as_ref().unwrap(),
-        pending.token.as_ref().unwrap(),
+        session_id,
+        token,
         cid,
         event_tx.clone(),
         dave.clone(),

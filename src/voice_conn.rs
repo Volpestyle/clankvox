@@ -255,7 +255,6 @@ async fn ip_discovery(socket: &UdpSocket, ssrc: u32) -> Result<(String, u16)> {
 // ---------------------------------------------------------------------------
 
 pub struct VoiceConnection {
-    ws_cmd_tx: mpsc::Sender<WsCommand>,
     pub ssrc: u32,
     shutdown: Arc<AtomicBool>,
     udp_socket: Arc<UdpSocket>,
@@ -515,7 +514,6 @@ impl VoiceConnection {
         let _ = event_tx.send(VoiceEvent::Ready { ssrc }).await;
 
         Ok(VoiceConnection {
-            ws_cmd_tx,
             ssrc,
             shutdown,
             udp_socket: udp,
@@ -540,17 +538,6 @@ impl VoiceConnection {
 
         self.udp_socket.send(&packet).await.context("UDP send")?;
         Ok(())
-    }
-
-    pub async fn set_speaking(&self, speaking: bool) {
-        let flags: u32 = if speaking { 1 } else { 0 }; // MICROPHONE
-        let _ = self
-            .ws_cmd_tx
-            .send(WsCommand::SendJson(json!({
-                "op": 5,
-                "d": { "speaking": flags, "delay": 0, "ssrc": self.ssrc }
-            })))
-            .await;
     }
 
     pub fn shutdown(&self) {

@@ -93,15 +93,6 @@ impl DaveManager {
         Ok(())
     }
 
-    pub fn create_key_package(&mut self) -> Result<Vec<u8>> {
-        let pkg = self
-            .session
-            .create_key_package()
-            .map_err(|e| anyhow::anyhow!("create_key_package: {:?}", e))?;
-        debug!("DAVE: key package created ({} bytes)", pkg.len());
-        Ok(pkg)
-    }
-
     pub fn process_proposals(
         &mut self,
         op_type: ProposalsOperationType,
@@ -386,33 +377,16 @@ impl DaveManager {
         }
     }
 
-    pub fn has_pending_transitions(&self) -> bool {
-        !self.pending_transitions.is_empty()
-    }
-
     pub fn has_pending_transition_id(&self, transition_id: u16) -> bool {
         self.pending_transitions.contains_key(&transition_id)
-    }
-
-    pub fn is_reinitializing(&self) -> bool {
-        self.reinitializing
     }
 
     pub fn can_passthrough(&self, user_id: u64) -> bool {
         self.session.can_passthrough(user_id)
     }
 
-    pub fn set_passthrough(&mut self, enabled: bool, duration_secs: Option<u32>) {
-        self.session.set_passthrough_mode(enabled, duration_secs);
-        warn!("DAVE: passthrough mode set to {}", enabled);
-    }
-
     pub fn user_id(&self) -> u64 {
         self.user_id
-    }
-
-    pub fn channel_id(&self) -> u64 {
-        self.channel_id
     }
 
     pub fn known_user_ids(&self) -> Vec<u64> {
