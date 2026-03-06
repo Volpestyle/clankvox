@@ -211,9 +211,27 @@ fn send_error(message: &str) {
     });
 }
 
-fn send_tts_playback_state(status: &str) {
+fn send_tts_playback_state(status: &str, reason: &str) {
+    info!(
+        status = status,
+        reason = reason,
+        "clankvox_tts_playback_state"
+    );
     send_msg(&OutMsg::TtsPlaybackState {
         status: status.to_string(),
+    });
+}
+
+fn send_buffer_depth(tts_samples: usize, music_samples: usize, reason: &str) {
+    info!(
+        tts_samples = tts_samples,
+        music_samples = music_samples,
+        reason = reason,
+        "clankvox_buffer_depth"
+    );
+    send_msg(&OutMsg::BufferDepth {
+        tts_samples,
+        music_samples,
     });
 }
 
@@ -464,6 +482,33 @@ mod tests {
         assert!(command.contains("yt-dlp"));
         assert!(command.contains("| ffmpeg "));
     }
+
+    #[test]
+    fn tts_partial_tail_flushes_after_short_stall() {
+        let mut state = AudioSendState::new().expect("audio state");
+        state.push_pcm(vec![123; 480]);
+
+        assert_eq!(state.tts_buffer_samples(), 480);
+        assert!(state.next_opus_frame().is_none());
+        assert_eq!(state.tts_buffer_samples(), 480);
+
+        let frame = state.next_opus_frame().expect("partial tail should flush");
+        assert!(!frame.is_empty());
+        assert_eq!(state.tts_buffer_samples(), 0);
+    }
+
+    #[test]
+    fn tts_partial_tail_coalesces_before_flush_threshold() {
+        let mut state = AudioSendState::new().expect("audio state");
+        state.push_pcm(vec![123; 480]);
+
+        assert!(state.next_opus_frame().is_none());
+        state.push_pcm(vec![123; 480]);
+
+        let frame = state.next_opus_frame().expect("full frame should encode once tail grows");
+        assert!(!frame.is_empty());
+        assert_eq!(state.tts_buffer_samples(), 0);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -616,10 +661,12 @@ struct AudioSendState {
     encoder: OpusEncoder,
     speaking: bool,
     trailing_silence_frames: u32,
+    partial_tts_stall_ticks: u32,
 }
 
 const MAX_TRAILING_SILENCE: u32 = 5; // 100ms of trailing silence
 const MAX_PCM_BUFFER_SAMPLES: usize = 720_000; // 15 seconds @ 48kHz mono
+const PARTIAL_TTS_FLUSH_TICKS: u32 = 2; // Flush an underfilled tail after 40ms of no growth
 
 impl AudioSendState {
     fn new() -> Result<Self> {
@@ -633,6 +680,7 @@ impl AudioSendState {
             encoder,
             speaking: false,
             trailing_silence_frames: 0,
+            partial_tts_stall_ticks: 0,
         })
     }
 
@@ -651,6 +699,7 @@ impl AudioSendState {
             self.pcm_buffer.drain(..overflow);
         }
         self.trailing_silence_frames = 0;
+        self.partial_tts_stall_ticks = 0;
     }
 
     fn push_music_pcm(&mut self, samples: Vec<i16>) {
@@ -674,10 +723,12 @@ impl AudioSendState {
         self.pcm_buffer.clear();
         self.music_buffer.clear();
         self.trailing_silence_frames = MAX_TRAILING_SILENCE;
+        self.partial_tts_stall_ticks = 0;
     }
 
     fn clear_tts(&mut self) {
         self.pcm_buffer.clear();
+        self.partial_tts_stall_ticks = 0;
     }
 
     /// Encode the next 20ms frame, mixing TTS and music buffers.
@@ -685,8 +736,31 @@ impl AudioSendState {
     fn next_opus_frame(&mut self) -> Option<Vec<u8>> {
         const FRAME_SIZE: usize = 960; // 20ms @ 48kHz mono
 
-        let has_tts = self.pcm_buffer.len() >= FRAME_SIZE;
-        let has_music = self.music_buffer.len() >= FRAME_SIZE;
+        let available_tts = self.pcm_buffer.len();
+        let available_music = self.music_buffer.len();
+        let has_music = available_music >= FRAME_SIZE;
+        let has_full_tts = available_tts >= FRAME_SIZE;
+        let has_partial_tts = available_tts > 0 && available_tts < FRAME_SIZE;
+
+        if has_full_tts {
+            self.partial_tts_stall_ticks = 0;
+        } else if has_partial_tts {
+            self.partial_tts_stall_ticks = self.partial_tts_stall_ticks.saturating_add(1);
+        } else {
+            self.partial_tts_stall_ticks = 0;
+        }
+
+        let flush_partial_tts =
+            has_partial_tts &&
+            (has_music || self.partial_tts_stall_ticks >= PARTIAL_TTS_FLUSH_TICKS);
+        let tts_samples_to_take = if has_full_tts {
+            FRAME_SIZE
+        } else if flush_partial_tts {
+            available_tts
+        } else {
+            0
+        };
+        let has_tts = tts_samples_to_take > 0;
 
         if has_tts || has_music {
             let mut mixed = [0i32; FRAME_SIZE];
@@ -697,7 +771,14 @@ impl AudioSendState {
                 }
             }
             if has_tts {
-                for (i, s) in self.pcm_buffer.drain(..FRAME_SIZE).enumerate() {
+                if flush_partial_tts && tts_samples_to_take < FRAME_SIZE {
+                    info!(
+                        queued_samples = available_tts,
+                        stall_ticks = self.partial_tts_stall_ticks,
+                        "clankvox_tts_partial_frame_flushed"
+                    );
+                }
+                for (i, s) in self.pcm_buffer.drain(..tts_samples_to_take).enumerate() {
                     mixed[i] += s as i32; // TTS at full volume always
                 }
             }
@@ -712,6 +793,7 @@ impl AudioSendState {
                 Ok(len) => {
                     self.speaking = true;
                     self.trailing_silence_frames = 0;
+                    self.partial_tts_stall_ticks = 0;
                     return Some(opus_buf[..len].to_vec());
                 }
                 Err(e) => {
@@ -719,6 +801,14 @@ impl AudioSendState {
                     return None;
                 }
             }
+        }
+
+        if has_partial_tts {
+            // Hold a short underfilled tail briefly so adjacent deltas can coalesce
+            // into a full 20ms frame; otherwise we would pad too aggressively and
+            // create choppy playback. If the tail does not grow, a later tick will
+            // flush it as a padded final frame.
+            return None;
         }
 
         // Buffer empty — send trailing silence to avoid abrupt cutoff
@@ -1319,7 +1409,7 @@ async fn main() {
                                     }
                                 }
                                 if emit_tts_buffered {
-                                    send_tts_playback_state("buffered");
+                                    send_tts_playback_state("buffered", "tts_pcm_enqueued");
                                 }
                             }
                         }
@@ -1346,7 +1436,7 @@ async fn main() {
                         clear_audio_send_buffer(&audio_send_state);
                         if tts_playback_buffered {
                             tts_playback_buffered = false;
-                            send_tts_playback_state("idle");
+                            send_tts_playback_state("idle", "stop_playback");
                         }
                         send_msg(&OutMsg::PlayerState {
                             status: "idle".into(),
@@ -1358,7 +1448,7 @@ async fn main() {
                         clear_tts_send_buffer(&audio_send_state);
                         if tts_playback_buffered {
                             tts_playback_buffered = false;
-                            send_tts_playback_state("idle");
+                            send_tts_playback_state("idle", "stop_tts_playback");
                         }
                     }
 
@@ -1468,7 +1558,7 @@ async fn main() {
                             clear_audio_send_buffer(&audio_send_state);
                             if tts_playback_buffered {
                                 tts_playback_buffered = false;
-                                send_tts_playback_state("idle");
+                                send_tts_playback_state("idle", "music_stop");
                             }
                             send_msg(&OutMsg::PlayerState {
                                 status: "idle".into(),
@@ -2063,7 +2153,7 @@ async fn main() {
                         clear_audio_send_buffer(&audio_send_state);
                         if tts_playback_buffered {
                             tts_playback_buffered = false;
-                            send_tts_playback_state("idle");
+                            send_tts_playback_state("idle", "music_track_finished");
                         }
                         send_msg(&OutMsg::PlayerState {
                             status: "idle".into(),
@@ -2085,36 +2175,27 @@ async fn main() {
                         if tts > 0 || music > 0 {
                             buffer_depth_was_nonempty = true;
                             drop(guard);
-                            send_msg(&OutMsg::BufferDepth {
-                                tts_samples: tts,
-                                music_samples: music,
-                            });
+                            send_buffer_depth(tts, music, "periodic_nonempty");
                             if tts > 0 && !tts_playback_buffered {
                                 tts_playback_buffered = true;
-                                send_tts_playback_state("buffered");
+                                send_tts_playback_state("buffered", "periodic_nonempty");
                             }
                         } else if buffer_depth_was_nonempty {
                             buffer_depth_was_nonempty = false;
                             drop(guard);
-                            send_msg(&OutMsg::BufferDepth {
-                                tts_samples: 0,
-                                music_samples: 0,
-                            });
+                            send_buffer_depth(0, 0, "periodic_drained");
                             if tts_playback_buffered {
                                 tts_playback_buffered = false;
-                                send_tts_playback_state("idle");
+                                send_tts_playback_state("idle", "periodic_drained");
                             }
                         }
                     } else if buffer_depth_was_nonempty {
                         buffer_depth_was_nonempty = false;
                         drop(guard);
-                        send_msg(&OutMsg::BufferDepth {
-                            tts_samples: 0,
-                            music_samples: 0,
-                        });
+                        send_buffer_depth(0, 0, "audio_send_state_missing");
                         if tts_playback_buffered {
                             tts_playback_buffered = false;
-                            send_tts_playback_state("idle");
+                            send_tts_playback_state("idle", "audio_send_state_missing");
                         }
                     }
                 }
