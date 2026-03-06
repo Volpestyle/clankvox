@@ -138,6 +138,9 @@ enum OutMsg {
     PlaybackArmed {
         reason: String,
     },
+    TtsPlaybackState {
+        status: String,
+    },
     SpeakingStart {
         #[serde(rename = "userId")]
         user_id: String,
@@ -205,6 +208,12 @@ fn send_msg(msg: &OutMsg) {
 fn send_error(message: &str) {
     send_msg(&OutMsg::Error {
         message: message.to_string(),
+    });
+}
+
+fn send_tts_playback_state(status: &str) {
+    send_msg(&OutMsg::TtsPlaybackState {
+        status: status.to_string(),
     });
 }
 
@@ -610,7 +619,7 @@ struct AudioSendState {
 }
 
 const MAX_TRAILING_SILENCE: u32 = 5; // 100ms of trailing silence
-const MAX_PCM_BUFFER_SAMPLES: usize = 240_000; // 5 seconds @ 48kHz mono
+const MAX_PCM_BUFFER_SAMPLES: usize = 720_000; // 15 seconds @ 48kHz mono
 
 impl AudioSendState {
     fn new() -> Result<Self> {
@@ -632,6 +641,13 @@ impl AudioSendState {
         // Drop oldest samples to keep the buffer bounded (prevents runaway latency)
         if self.pcm_buffer.len() > MAX_PCM_BUFFER_SAMPLES {
             let overflow = self.pcm_buffer.len() - MAX_PCM_BUFFER_SAMPLES;
+            warn!(
+                "TTS PCM buffer overflow: dropping {} oldest samples ({:.1}ms), buffer was {} samples ({:.1}ms)",
+                overflow,
+                overflow as f64 / 48.0,
+                self.pcm_buffer.len(),
+                self.pcm_buffer.len() as f64 / 48.0
+            );
             self.pcm_buffer.drain(..overflow);
         }
         self.trailing_silence_frames = 0;
@@ -1137,7 +1153,7 @@ async fn main() {
     // Audio send pipeline: IPC audio → PCM buffer → 20ms Opus encode → DAVE encrypt → RTP
     let audio_send_state = Arc::new(Mutex::new(None::<AudioSendState>));
     let mut send_interval = time::interval(Duration::from_millis(20));
-    send_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    send_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     send_interval.tick().await; // consume first immediate tick
 
     // Music → PCM channel (feeds into audio_send_state)
@@ -1173,8 +1189,12 @@ async fn main() {
     let (asr_exit_tx, mut asr_exit_rx) = mpsc::channel::<(u64, String)>(32);
     let mut speaking_states: HashMap<u64, SpeakingState> = HashMap::new();
 
-    // Buffer depth reporting: emit every 25 ticks (500ms) when buffer is non-empty
+    // Buffer depth reporting: emit every 25 ticks (500ms) while buffered, and
+    // emit one final zero-depth update when playback drains so the main process
+    // can clear its backlog state.
     let mut buffer_depth_tick_counter: u32 = 0;
+    let mut buffer_depth_was_nonempty = false;
+    let mut tts_playback_buffered = false;
     const BUFFER_DEPTH_REPORT_INTERVAL: u32 = 25; // 25 × 20ms = 500ms
 
     loop {
@@ -1287,9 +1307,19 @@ async fn main() {
                         if let Ok(raw) = engine.decode(&pcm_base64) {
                             let samples = convert_llm_to_48k_mono(&raw, sample_rate);
                             if !samples.is_empty() {
-                                let mut guard = audio_send_state.lock();
-                                if let Some(ref mut state) = *guard {
-                                    state.push_pcm(samples);
+                                let mut emit_tts_buffered = false;
+                                {
+                                    let mut guard = audio_send_state.lock();
+                                    if let Some(ref mut state) = *guard {
+                                        state.push_pcm(samples);
+                                        if state.tts_buffer_samples() > 0 && !tts_playback_buffered {
+                                            tts_playback_buffered = true;
+                                            emit_tts_buffered = true;
+                                        }
+                                    }
+                                }
+                                if emit_tts_buffered {
+                                    send_tts_playback_state("buffered");
                                 }
                             }
                         }
@@ -1314,6 +1344,10 @@ async fn main() {
                         pending_music_resolved_direct_url = false;
                         drain_music_pcm_queue(&music_pcm_rx);
                         clear_audio_send_buffer(&audio_send_state);
+                        if tts_playback_buffered {
+                            tts_playback_buffered = false;
+                            send_tts_playback_state("idle");
+                        }
                         send_msg(&OutMsg::PlayerState {
                             status: "idle".into(),
                         });
@@ -1322,6 +1356,10 @@ async fn main() {
 
                     InMsg::StopTtsPlayback => {
                         clear_tts_send_buffer(&audio_send_state);
+                        if tts_playback_buffered {
+                            tts_playback_buffered = false;
+                            send_tts_playback_state("idle");
+                        }
                     }
 
                     InMsg::SubscribeUser {
@@ -1428,6 +1466,10 @@ async fn main() {
                             music_finishing = false;
                             drain_music_pcm_queue(&music_pcm_rx);
                             clear_audio_send_buffer(&audio_send_state);
+                            if tts_playback_buffered {
+                                tts_playback_buffered = false;
+                                send_tts_playback_state("idle");
+                            }
                             send_msg(&OutMsg::PlayerState {
                                 status: "idle".into(),
                             });
@@ -2019,6 +2061,10 @@ async fn main() {
                         pending_music_resolved_direct_url = false;
                         drain_music_pcm_queue(&music_pcm_rx);
                         clear_audio_send_buffer(&audio_send_state);
+                        if tts_playback_buffered {
+                            tts_playback_buffered = false;
+                            send_tts_playback_state("idle");
+                        }
                         send_msg(&OutMsg::PlayerState {
                             status: "idle".into(),
                         });
@@ -2027,7 +2073,8 @@ async fn main() {
                     }
                 }
 
-                // Report buffer depth periodically (every 500ms when non-empty)
+                // Report buffer depth periodically (every 500ms while buffered),
+                // plus a single zero-depth event on the transition to empty.
                 buffer_depth_tick_counter += 1;
                 if buffer_depth_tick_counter >= BUFFER_DEPTH_REPORT_INTERVAL {
                     buffer_depth_tick_counter = 0;
@@ -2036,11 +2083,38 @@ async fn main() {
                         let tts = state.tts_buffer_samples();
                         let music = state.music_buffer_samples();
                         if tts > 0 || music > 0 {
+                            buffer_depth_was_nonempty = true;
                             drop(guard);
                             send_msg(&OutMsg::BufferDepth {
                                 tts_samples: tts,
                                 music_samples: music,
                             });
+                            if tts > 0 && !tts_playback_buffered {
+                                tts_playback_buffered = true;
+                                send_tts_playback_state("buffered");
+                            }
+                        } else if buffer_depth_was_nonempty {
+                            buffer_depth_was_nonempty = false;
+                            drop(guard);
+                            send_msg(&OutMsg::BufferDepth {
+                                tts_samples: 0,
+                                music_samples: 0,
+                            });
+                            if tts_playback_buffered {
+                                tts_playback_buffered = false;
+                                send_tts_playback_state("idle");
+                            }
+                        }
+                    } else if buffer_depth_was_nonempty {
+                        buffer_depth_was_nonempty = false;
+                        drop(guard);
+                        send_msg(&OutMsg::BufferDepth {
+                            tts_samples: 0,
+                            music_samples: 0,
+                        });
+                        if tts_playback_buffered {
+                            tts_playback_buffered = false;
+                            send_tts_playback_state("idle");
                         }
                     }
                 }

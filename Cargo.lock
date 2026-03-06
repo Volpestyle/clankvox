@@ -187,6 +187,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "clankvox"
+version = "0.2.0"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "audiopus",
+ "base64",
+ "chacha20poly1305",
+ "crossbeam-channel",
+ "davey",
+ "futures-util",
+ "libc",
+ "parking_lot 0.12.5",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "cmake"
 version = "0.1.57"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2136,29 +2159,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "voice_subprocess"
-version = "0.2.0"
-dependencies = [
- "aes-gcm",
- "anyhow",
- "audiopus",
- "base64",
- "chacha20poly1305",
- "crossbeam-channel",
- "davey",
- "futures-util",
- "libc",
- "parking_lot 0.12.5",
- "rustls",
- "serde",
- "serde_json",
- "tokio",
- "tokio-tungstenite",
- "tracing",
- "tracing-subscriber",
-]
 
 [[package]]
 name = "wasi"
