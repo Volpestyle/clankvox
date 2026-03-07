@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use tokio::time;
 use tracing::{info, warn};
 
-use crate::{clear_audio_send_buffer, AudioSendState};
+use crate::audio_pipeline::{clear_audio_send_buffer, AudioSendState};
 
 const MUSIC_PIPELINE_STDERR_TAIL_LINES: usize = 24;
 

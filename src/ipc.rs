@@ -68,27 +68,6 @@ pub enum InMsg {
         #[serde(rename = "fadeMs", default)]
         fade_ms: u32,
     },
-    ConnectAsr {
-        #[serde(rename = "userId")]
-        user_id: String,
-        #[serde(rename = "apiKey")]
-        api_key: String,
-        model: String,
-        language: Option<String>,
-        prompt: Option<String>,
-    },
-    DisconnectAsr {
-        #[serde(rename = "userId")]
-        user_id: String,
-    },
-    CommitAsr {
-        #[serde(rename = "userId")]
-        user_id: String,
-    },
-    ClearAsr {
-        #[serde(rename = "userId")]
-        user_id: String,
-    },
     Destroy,
 }
 
@@ -164,18 +143,6 @@ pub enum OutMsg {
     },
     MusicGainReached {
         gain: f32,
-    },
-    AsrTranscript {
-        #[serde(rename = "userId")]
-        user_id: String,
-        text: String,
-        #[serde(rename = "isFinal")]
-        is_final: bool,
-    },
-    AsrDisconnected {
-        #[serde(rename = "userId")]
-        user_id: String,
-        reason: String,
     },
     Error {
         code: ErrorCode,
@@ -328,9 +295,23 @@ pub fn send_gateway_voice_state_update(guild_id: u64, channel_id: u64, self_mute
     });
 }
 
-pub fn spawn_ipc_reader(
-    audio_debug: bool,
-) -> (mpsc::UnboundedReceiver<InMsg>, mpsc::Receiver<InMsg>) {
+pub struct InboundIpc {
+    control_rx: mpsc::UnboundedReceiver<InMsg>,
+    audio_rx: mpsc::Receiver<InMsg>,
+}
+
+impl InboundIpc {
+    pub async fn recv(&mut self) -> Option<InMsg> {
+        tokio::select! {
+            biased;
+            Some(msg) = self.control_rx.recv() => Some(msg),
+            Some(msg) = self.audio_rx.recv() => Some(msg),
+            else => None,
+        }
+    }
+}
+
+pub fn spawn_ipc_reader(audio_debug: bool) -> InboundIpc {
     let (control_tx, control_rx) = mpsc::unbounded_channel::<InMsg>();
     let (audio_tx, audio_rx) = mpsc::channel::<InMsg>(256);
 
@@ -418,7 +399,7 @@ pub fn spawn_ipc_reader(
         let _ = control_tx.send(InMsg::Destroy);
     });
 
-    (control_rx, audio_rx)
+    InboundIpc { control_rx, audio_rx }
 }
 
 pub fn spawn_ipc_writer() {
