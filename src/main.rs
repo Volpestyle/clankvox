@@ -283,16 +283,61 @@ impl AppState {
         }
     }
 
-    async fn attempt_connect(&mut self) -> TryConnectOutcome {
-        try_connect(
-            &self.pending_conn,
-            self.guild_id,
-            self.channel_id,
-            &self.voice_event_tx,
-            &self.dave,
-            &mut self.voice_conn,
+    async fn try_connect(&mut self) -> TryConnectOutcome {
+        if self.voice_conn.is_some() {
+            return TryConnectOutcome::AlreadyConnected;
+        }
+        let Some(gid) = self.guild_id else {
+            return TryConnectOutcome::MissingData;
+        };
+        let Some(cid) = self.channel_id else {
+            return TryConnectOutcome::MissingData;
+        };
+        let Some(uid) = self.pending_conn.user_id else {
+            return TryConnectOutcome::MissingData;
+        };
+        let Some(endpoint) = self.pending_conn.endpoint.as_deref() else {
+            return TryConnectOutcome::MissingData;
+        };
+        let Some(session_id) = self.pending_conn.session_id.as_deref() else {
+            return TryConnectOutcome::MissingData;
+        };
+        let Some(token) = self.pending_conn.token.as_deref() else {
+            return TryConnectOutcome::MissingData;
+        };
+
+        info!(
+            "Connecting to voice: endpoint={:?} guild={} channel={} user={}",
+            self.pending_conn.endpoint, gid, cid, uid
+        );
+
+        match VoiceConnection::connect(
+            VoiceConnectionParams {
+                endpoint,
+                guild_id: gid,
+                user_id: uid,
+                session_id,
+                token,
+                channel_id: cid,
+            },
+            self.voice_event_tx.clone(),
+            self.dave.clone(),
         )
         .await
+        {
+            Ok(conn) => {
+                self.voice_conn = Some(conn);
+                TryConnectOutcome::Connected
+            }
+            Err(e) => {
+                error!("Voice connection failed: {e}");
+                send_error(
+                    ErrorCode::VoiceConnectFailed,
+                    format!("Voice connect failed: {e}"),
+                );
+                TryConnectOutcome::Failed
+            }
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -341,7 +386,7 @@ impl AppState {
                 if let Some(tk) = data.token.as_deref() {
                     self.pending_conn.token = Some(tk.to_string());
                 }
-                let outcome = self.attempt_connect().await;
+                let outcome = self.try_connect().await;
                 self.apply_connect_outcome(outcome, "voice_server_connect_failed");
             }
             InMsg::VoiceState { data } => {
@@ -376,7 +421,7 @@ impl AppState {
                     self.pending_conn.user_id = Some(uid);
                     self.self_user_id = Some(uid);
                 }
-                let outcome = self.attempt_connect().await;
+                let outcome = self.try_connect().await;
                 self.apply_connect_outcome(outcome, "voice_state_connect_failed");
             }
             InMsg::Audio {
@@ -836,7 +881,7 @@ impl AppState {
 
     async fn handle_reconnect_timer(&mut self) {
         self.reconnect_deadline = None;
-        let outcome = self.attempt_connect().await;
+        let outcome = self.try_connect().await;
         match outcome {
             TryConnectOutcome::Connected | TryConnectOutcome::AlreadyConnected => {
                 self.reconnect_attempt = 0;
@@ -1196,69 +1241,4 @@ enum TryConnectOutcome {
     MissingData,
     Connected,
     Failed,
-}
-
-/// Attempt to establish the voice connection once we have all required info.
-async fn try_connect(
-    pending: &PendingConnection,
-    guild_id: Option<u64>,
-    channel_id: Option<u64>,
-    event_tx: &mpsc::Sender<VoiceEvent>,
-    dave: &Arc<Mutex<Option<DaveManager>>>,
-    voice_conn: &mut Option<VoiceConnection>,
-) -> TryConnectOutcome {
-    if voice_conn.is_some() {
-        return TryConnectOutcome::AlreadyConnected;
-    }
-    let Some(gid) = guild_id else {
-        return TryConnectOutcome::MissingData;
-    };
-    let Some(cid) = channel_id else {
-        return TryConnectOutcome::MissingData;
-    };
-    let Some(uid) = pending.user_id else {
-        return TryConnectOutcome::MissingData;
-    };
-    let Some(endpoint) = pending.endpoint.as_deref() else {
-        return TryConnectOutcome::MissingData;
-    };
-    let Some(session_id) = pending.session_id.as_deref() else {
-        return TryConnectOutcome::MissingData;
-    };
-    let Some(token) = pending.token.as_deref() else {
-        return TryConnectOutcome::MissingData;
-    };
-
-    info!(
-        "Connecting to voice: endpoint={:?} guild={} channel={} user={}",
-        pending.endpoint, gid, cid, uid
-    );
-
-    match VoiceConnection::connect(
-        VoiceConnectionParams {
-            endpoint,
-            guild_id: gid,
-            user_id: uid,
-            session_id,
-            token,
-            channel_id: cid,
-        },
-        event_tx.clone(),
-        dave.clone(),
-    )
-    .await
-    {
-        Ok(conn) => {
-            *voice_conn = Some(conn);
-            TryConnectOutcome::Connected
-        }
-        Err(e) => {
-                        error!("Voice connection failed: {e}");
-            send_error(
-                ErrorCode::VoiceConnectFailed,
-                format!("Voice connect failed: {e}"),
-            );
-            TryConnectOutcome::Failed
-        }
-    }
 }
