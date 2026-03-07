@@ -14,6 +14,24 @@ use crate::ipc::{send_msg, OutMsg};
 use crate::ipc_protocol::CaptureCommand;
 use crate::voice_conn::VoiceEvent;
 
+fn update_speaking_state(
+    speaking_states: &mut std::collections::HashMap<u64, SpeakingState>,
+    user_id: u64,
+    now: time::Instant,
+) -> bool {
+    let speaking = speaking_states.entry(user_id).or_insert(SpeakingState {
+        last_packet_at: None,
+        is_speaking: false,
+    });
+    speaking.last_packet_at = Some(now);
+    if speaking.is_speaking {
+        false
+    } else {
+        speaking.is_speaking = true;
+        true
+    }
+}
+
 impl AppState {
     pub(crate) fn handle_capture_command(&mut self, msg: CaptureCommand) {
         match msg {
@@ -93,6 +111,12 @@ impl AppState {
                     return;
                 }
 
+                if update_speaking_state(&mut self.speaking_states, user_id, time::Instant::now()) {
+                    send_msg(&OutMsg::SpeakingStart {
+                        user_id: user_id.to_string(),
+                    });
+                }
+
                 let Some(state) = self.user_capture_states.get(&user_id) else {
                     return;
                 };
@@ -134,22 +158,6 @@ impl AppState {
                     Ok(samples_per_channel) => {
                         let total_samples = samples_per_channel * 2;
                         let decoded = &pcm_stereo[..total_samples];
-
-                        let now = time::Instant::now();
-                        let speaking =
-                            self.speaking_states
-                                .entry(user_id)
-                                .or_insert(SpeakingState {
-                                    last_packet_at: None,
-                                    is_speaking: false,
-                                });
-                        speaking.last_packet_at = Some(now);
-                        if !speaking.is_speaking {
-                            speaking.is_speaking = true;
-                            send_msg(&OutMsg::SpeakingStart {
-                                user_id: user_id.to_string(),
-                            });
-                        }
 
                         let (llm_pcm, peak, active, total) =
                             crate::audio_pipeline::convert_decoded_to_llm(
@@ -221,5 +229,37 @@ impl AppState {
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    use tokio::time;
+
+    use crate::capture::SpeakingState;
+
+    use super::update_speaking_state;
+
+    #[test]
+    fn update_speaking_state_only_triggers_on_first_packet_of_burst() {
+        let mut speaking_states: HashMap<u64, SpeakingState> = HashMap::new();
+        let first_packet_at = time::Instant::now();
+
+        assert!(update_speaking_state(&mut speaking_states, 42, first_packet_at));
+        assert!(!update_speaking_state(
+            &mut speaking_states,
+            42,
+            first_packet_at + Duration::from_millis(20)
+        ));
+
+        let state = speaking_states.get(&42).expect("speaking state inserted");
+        assert!(state.is_speaking);
+        assert_eq!(
+            state.last_packet_at,
+            Some(first_packet_at + Duration::from_millis(20))
+        );
     }
 }

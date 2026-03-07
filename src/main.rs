@@ -26,6 +26,13 @@ use crate::ipc::{spawn_ipc_reader, spawn_ipc_writer};
 use crate::music::MusicEvent;
 use crate::voice_conn::VoiceEvent;
 
+async fn reconnect_sleep(deadline: Option<time::Instant>) {
+    match deadline {
+        Some(deadline) => time::sleep_until(deadline).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
 #[tokio::main]
 async fn main() {
     rustls::crypto::ring::default_provider()
@@ -90,7 +97,7 @@ async fn main() {
                 state.handle_music_event(event);
             }
 
-            () = time::sleep_until(state.reconnect_deadline.expect("guarded deadline")), if state.reconnect_deadline.is_some() => {
+            () = reconnect_sleep(state.reconnect_deadline) => {
                 state.handle_reconnect_timer().await;
             }
 
@@ -101,4 +108,18 @@ async fn main() {
     }
 
     tracing::info!("Shutting down");
+}
+
+#[cfg(test)]
+mod tests {
+    use futures_util::FutureExt;
+
+    use super::reconnect_sleep;
+
+    #[test]
+    fn reconnect_sleep_without_deadline_is_pending() {
+        let future = reconnect_sleep(None);
+        tokio::pin!(future);
+        assert!(future.now_or_never().is_none());
+    }
 }

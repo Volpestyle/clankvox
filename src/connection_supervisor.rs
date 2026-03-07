@@ -4,6 +4,19 @@ use crate::ipc_protocol::ConnectionCommand;
 use crate::voice_conn::{VoiceConnection, VoiceConnectionParams};
 
 impl AppState {
+    async fn maybe_try_connect(&mut self, failure_reason: &str, source: &str) {
+        if self.reconnect_deadline.is_some() {
+            tracing::info!(
+                source = source,
+                "Reconnect already scheduled; deferring immediate voice connect"
+            );
+            return;
+        }
+
+        let outcome = self.try_connect().await;
+        self.apply_connect_outcome(outcome, failure_reason);
+    }
+
     pub(crate) fn apply_connect_outcome(&mut self, outcome: TryConnectOutcome, failure_reason: &str) {
         match outcome {
             TryConnectOutcome::Connected => self.reset_reconnect(),
@@ -126,8 +139,8 @@ impl AppState {
                 if let Some(token) = data.token.as_deref() {
                     self.pending_conn.token = Some(token.to_string());
                 }
-                let outcome = self.try_connect().await;
-                self.apply_connect_outcome(outcome, "voice_server_connect_failed");
+                self.maybe_try_connect("voice_server_connect_failed", "voice_server")
+                    .await;
             }
             ConnectionCommand::VoiceState { data } => {
                 let new_session_id = data.session_id.clone();
@@ -160,8 +173,8 @@ impl AppState {
                     self.pending_conn.user_id = Some(user_id);
                     self.self_user_id = Some(user_id);
                 }
-                let outcome = self.try_connect().await;
-                self.apply_connect_outcome(outcome, "voice_state_connect_failed");
+                self.maybe_try_connect("voice_state_connect_failed", "voice_state")
+                    .await;
             }
         }
     }

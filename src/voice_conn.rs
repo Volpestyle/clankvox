@@ -697,9 +697,11 @@ async fn recv_hello(
             .context("WS stream ended")?
             .context("WS error")?;
         if let Message::Text(text) = msg {
-            let message: VoiceOpcode<HelloPayload> = parse_voice_opcode(&text)?;
+            let message: VoiceOpcode<Value> = parse_voice_opcode(&text)?;
             if message.op == 8 {
-                return Ok(message.d.heartbeat_interval.unwrap_or(13_750.0));
+                let payload: HelloPayload =
+                    serde_json::from_value(message.d).context("invalid hello payload")?;
+                return Ok(payload.heartbeat_interval.unwrap_or(13_750.0));
             }
         }
     }
@@ -718,14 +720,16 @@ async fn recv_ready(
             .context("WS error")?;
         match &msg {
             Message::Text(text) => {
-                let message: VoiceOpcode<ReadyPayload> = parse_voice_opcode(text)?;
+                let message: VoiceOpcode<Value> = parse_voice_opcode(text)?;
                 if message.op == 2 {
+                    let payload: ReadyPayload =
+                        serde_json::from_value(message.d).context("invalid ready payload")?;
                     let ReadyPayload {
                         ssrc,
                         ip,
                         port,
                         modes,
-                    } = message.d;
+                    } = payload;
                     return Ok((ssrc, ip, port, modes));
                 }
                 debug!("Handshake (waiting OP2): buffered text op={op}", op = message.op);
@@ -757,9 +761,11 @@ async fn recv_session_description(
             .context("WS error")?;
         match &msg {
             Message::Text(text) => {
-                let message: VoiceOpcode<SessionDescriptionPayload> = parse_voice_opcode(text)?;
+                let message: VoiceOpcode<Value> = parse_voice_opcode(text)?;
                 if message.op == 4 {
-                    return Ok((message.d.secret_key, message.d.dave_protocol_version));
+                    let payload: SessionDescriptionPayload = serde_json::from_value(message.d)
+                        .context("invalid session description payload")?;
+                    return Ok((payload.secret_key, payload.dave_protocol_version));
                 }
                 debug!("Handshake (waiting OP4): buffered text op={op}", op = message.op);
                 overflow.push(msg);
@@ -1597,10 +1603,14 @@ async fn udp_recv_loop(
 
 #[cfg(test)]
 mod tests {
+    use futures_util::stream;
+
     use super::{
-        build_rtp_header, parse_rtp_header, parse_user_id, parse_voice_opcode, HelloPayload,
-        SessionDescriptionPayload, TransportCrypto, VoiceOpcode, OPUS_PT, RTP_HEADER_LEN,
+        build_rtp_header, parse_rtp_header, parse_user_id, parse_voice_opcode, recv_ready,
+        recv_session_description, HelloPayload, SessionDescriptionPayload, TransportCrypto,
+        VoiceOpcode, OPUS_PT, RTP_HEADER_LEN,
     };
+    use tokio_tungstenite::tungstenite::Message;
 
     #[test]
     fn rtp_header_round_trips() {
@@ -1688,5 +1698,47 @@ mod tests {
     fn parse_user_id_rejects_non_numeric_values() {
         assert_eq!(parse_user_id("42", "test"), Some(42));
         assert_eq!(parse_user_id("bad", "test"), None);
+    }
+
+    #[tokio::test]
+    async fn recv_ready_buffers_non_target_text_frames() {
+        let mut ws = stream::iter(vec![
+            Ok(Message::Text(r#"{"op":6,"d":{}}"#.into())),
+            Ok(Message::Text(
+                r#"{"op":2,"d":{"ssrc":9689,"ip":"104.29.137.71","port":19296,"modes":["aead_aes256_gcm_rtpsize"]}}"#
+                    .into(),
+            )),
+        ]);
+        let mut overflow = Vec::new();
+
+        let (ssrc, ip, port, modes) = recv_ready(&mut ws, &mut overflow)
+            .await
+            .expect("ready payload");
+
+        assert_eq!(ssrc, 9689);
+        assert_eq!(ip, "104.29.137.71");
+        assert_eq!(port, 19296);
+        assert_eq!(modes, vec!["aead_aes256_gcm_rtpsize"]);
+        assert_eq!(overflow.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn recv_session_description_buffers_non_target_text_frames() {
+        let mut ws = stream::iter(vec![
+            Ok(Message::Text(r#"{"op":18,"d":{"streams":[]}}"#.into())),
+            Ok(Message::Text(
+                r#"{"op":4,"d":{"secret_key":[1,2,3,4],"dave_protocol_version":1}}"#.into(),
+            )),
+        ]);
+        let mut overflow = Vec::new();
+
+        let (secret_key, dave_protocol_version) =
+            recv_session_description(&mut ws, &mut overflow)
+                .await
+                .expect("session description payload");
+
+        assert_eq!(secret_key, vec![1, 2, 3, 4]);
+        assert_eq!(dave_protocol_version, 1);
+        assert_eq!(overflow.len(), 1);
     }
 }
