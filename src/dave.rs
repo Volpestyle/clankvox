@@ -444,8 +444,8 @@ mod tests {
         let mut manager = new_manager();
 
         assert!(manager.prepare_transition(9, 0));
-        manager.pending_downgrade_since =
-            Some(Instant::now() - Duration::from_secs(PENDING_DOWNGRADE_AUTO_EXECUTE_SECS + 1));
+        manager.pending_downgrade_since = Instant::now()
+            .checked_sub(Duration::from_secs(PENDING_DOWNGRADE_AUTO_EXECUTE_SECS + 1));
 
         assert_eq!(manager.maybe_auto_execute_downgrade(), Some(9));
         assert_eq!(manager.protocol_version(), 0);

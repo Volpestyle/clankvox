@@ -6,7 +6,13 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-static IPC_TX: std::sync::OnceLock<crossbeam::Sender<OutMsg>> = std::sync::OnceLock::new();
+#[derive(Clone, Debug)]
+struct IpcSenders {
+    control_tx: crossbeam::Sender<OutMsg>,
+    audio_tx: crossbeam::Sender<OutMsg>,
+}
+
+static IPC_TX: std::sync::OnceLock<IpcSenders> = std::sync::OnceLock::new();
 const MAX_STDIN_LINE_BYTES: usize = 1_024 * 1_024;
 
 #[derive(Deserialize, Debug)]
@@ -250,16 +256,15 @@ pub fn send_msg(msg: &OutMsg) {
     if let Some(tx) = IPC_TX.get() {
         if is_lossy_ipc_msg(msg) {
             // Audio frames are lossy — drop on backpressure rather than blocking.
-            if let Err(err) = tx.try_send(msg.clone()) {
+            if let Err(err) = tx.audio_tx.try_send(msg.clone()) {
                 if !matches!(err, crossbeam::TrySendError::Full(_)) {
                     error!("failed to send lossy IPC message: {}", err);
                 }
             }
         } else {
-            // Control messages (Error, ConnectionState, AsrTranscript, etc.) must
-            // not be silently dropped — use blocking send. The bounded channel
-            // (512 slots) provides natural backpressure if the writer thread stalls.
-            if let Err(err) = tx.send(msg.clone()) {
+            // Control messages must not block real-time async tasks. Route them
+            // through an unbounded control lane handled by the writer thread.
+            if let Err(err) = tx.control_tx.send(msg.clone()) {
                 error!("failed to send control IPC message: {}", err);
             }
         }
@@ -279,10 +284,8 @@ pub fn try_send_error(code: ErrorCode, message: impl Into<String>) {
             code,
             message: message.into(),
         };
-        if let Err(err) = tx.try_send(msg) {
-            if !matches!(err, crossbeam::TrySendError::Full(_)) {
-                error!("failed to enqueue non-blocking IPC error: {}", err);
-            }
+        if let Err(err) = tx.control_tx.send(msg) {
+            error!("failed to enqueue non-blocking IPC error: {}", err);
         }
     }
 }
@@ -418,15 +421,37 @@ pub fn spawn_ipc_reader(
     (control_rx, audio_rx)
 }
 
-pub fn spawn_ipc_writer() -> crossbeam::Sender<OutMsg> {
+pub fn spawn_ipc_writer() {
     if let Some(tx) = IPC_TX.get() {
-        return tx.clone();
+        let _ = tx;
+        return;
     }
 
-    let (tx, rx) = crossbeam::bounded::<OutMsg>(512);
+    let (control_tx, control_rx) = crossbeam::unbounded::<OutMsg>();
+    let (audio_tx, audio_rx) = crossbeam::bounded::<OutMsg>(512);
     std::thread::spawn(move || {
         let mut out = io::stdout().lock();
-        for msg in rx {
+        loop {
+            let msg = match control_rx.try_recv() {
+                Ok(msg) => msg,
+                Err(crossbeam::TryRecvError::Empty) => {
+                    crossbeam::select! {
+                        recv(control_rx) -> msg => match msg {
+                            Ok(msg) => msg,
+                            Err(_) => break,
+                        },
+                        recv(audio_rx) -> msg => match msg {
+                            Ok(msg) => msg,
+                            Err(_) => break,
+                        },
+                    }
+                }
+                Err(crossbeam::TryRecvError::Disconnected) => match audio_rx.recv() {
+                    Ok(msg) => msg,
+                    Err(_) => break,
+                },
+            };
+
             match msg {
                 OutMsg::UserAudio {
                     user_id,
@@ -477,8 +502,14 @@ pub fn spawn_ipc_writer() -> crossbeam::Sender<OutMsg> {
             }
         }
     });
-    IPC_TX.set(tx.clone()).expect("IPC_TX already initialized");
-    tx
+
+    let senders = IpcSenders {
+        control_tx,
+        audio_tx,
+    };
+    IPC_TX
+        .set(senders.clone())
+        .expect("IPC_TX already initialized");
 }
 
 #[cfg(test)]

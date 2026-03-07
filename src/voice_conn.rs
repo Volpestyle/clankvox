@@ -14,6 +14,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::time;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::MaybeTlsStream;
@@ -101,7 +102,6 @@ pub enum VoiceEvent {
     OpusReceived { ssrc: u32, opus_frame: Vec<u8> },
     DaveReady,
     Disconnected { reason: String },
-    Error { message: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -338,6 +338,9 @@ pub struct VoiceConnection {
     crypto: Arc<TransportCrypto>,
     rtp_sequence: AtomicU32,
     timestamp: AtomicU32,
+    ws_read_task: JoinHandle<()>,
+    ws_write_task: JoinHandle<()>,
+    udp_recv_task: JoinHandle<()>,
 }
 
 impl VoiceConnection {
@@ -476,15 +479,17 @@ impl VoiceConnection {
         let udp = Arc::new(udp);
         let ssrc_map: Arc<Mutex<HashMap<u32, u64>>> = Arc::new(Mutex::new(HashMap::new()));
         let ws_sequence = Arc::new(AtomicI32::new(-1));
+        let disconnect_sent = Arc::new(AtomicBool::new(false));
 
         // WS read loop (handles Speaking updates, DAVE opcodes, etc.)
-        {
+        let ws_read_task = {
             let shutdown = shutdown.clone();
             let event_tx = event_tx.clone();
             let dave = dave.clone();
             let ws_cmd_tx = ws_cmd_tx.clone();
             let ssrc_map = ssrc_map.clone();
             let ws_sequence = ws_sequence.clone();
+            let disconnect_sent = disconnect_sent.clone();
             if !handshake_overflow.is_empty() {
                 info!(
                     "Replaying {} buffered handshake messages into read loop",
@@ -548,15 +553,18 @@ impl VoiceConnection {
                     user_id,
                     channel_id,
                     ws_sequence,
+                    disconnect_sent,
                 )
                 .await;
-            });
-        }
+            })
+        };
 
         // WS write loop (heartbeat + outgoing commands)
-        {
+        let ws_write_task = {
             let shutdown = shutdown.clone();
             let ws_sequence = ws_sequence.clone();
+            let event_tx = event_tx.clone();
+            let disconnect_sent = disconnect_sent.clone();
             tokio::spawn(async move {
                 ws_write_loop(
                     ws_write,
@@ -564,13 +572,15 @@ impl VoiceConnection {
                     shutdown,
                     heartbeat_interval,
                     ws_sequence,
+                    event_tx,
+                    disconnect_sent,
                 )
                 .await;
-            });
-        }
+            })
+        };
 
         // UDP receive loop
-        {
+        let udp_recv_task = {
             let shutdown = shutdown.clone();
             let event_tx = event_tx.clone();
             let crypto = crypto.clone();
@@ -578,10 +588,21 @@ impl VoiceConnection {
             let udp = udp.clone();
             let ssrc_map = ssrc_map.clone();
             let ws_cmd_tx = ws_cmd_tx.clone();
+            let disconnect_sent = disconnect_sent.clone();
             tokio::spawn(async move {
-                udp_recv_loop(udp, crypto, dave, ssrc_map, event_tx, ws_cmd_tx, shutdown).await;
-            });
-        }
+                udp_recv_loop(
+                    udp,
+                    crypto,
+                    dave,
+                    ssrc_map,
+                    event_tx,
+                    ws_cmd_tx,
+                    shutdown,
+                    disconnect_sent,
+                )
+                .await;
+            })
+        };
 
         // Set speaking state so Discord knows we may transmit
         let _ = ws_cmd_tx
@@ -601,6 +622,9 @@ impl VoiceConnection {
             crypto,
             rtp_sequence: AtomicU32::new(0),
             timestamp: AtomicU32::new(0),
+            ws_read_task,
+            ws_write_task,
+            udp_recv_task,
         })
     }
 
@@ -623,6 +647,32 @@ impl VoiceConnection {
 
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
+        self.ws_read_task.abort();
+        self.ws_write_task.abort();
+        self.udp_recv_task.abort();
+    }
+}
+
+impl Drop for VoiceConnection {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+async fn send_disconnect_once(
+    event_tx: &mpsc::Sender<VoiceEvent>,
+    disconnect_sent: &Arc<AtomicBool>,
+    reason: impl Into<String>,
+) {
+    if disconnect_sent
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        let _ = event_tx
+            .send(VoiceEvent::Disconnected {
+                reason: reason.into(),
+            })
+            .await;
     }
 }
 
@@ -742,6 +792,7 @@ async fn ws_read_loop(
     bot_user_id: u64,
     channel_id: u64,
     ws_sequence: Arc<AtomicI32>,
+    disconnect_sent: Arc<AtomicBool>,
 ) {
     while let Some(msg) = ws_read.next().await {
         if shutdown.load(Ordering::Relaxed) {
@@ -789,14 +840,11 @@ async fn ws_read_loop(
                     None => "WebSocket closed by server (no close frame)".into(),
                 };
                 warn!("{reason}");
-                let _ = event_tx.send(VoiceEvent::Disconnected { reason }).await;
+                send_disconnect_once(&event_tx, &disconnect_sent, reason).await;
                 break;
             }
             Err(e) => {
-                let _ = event_tx
-                    .send(VoiceEvent::Error {
-                        message: format!("WS read error: {e}"),
-                    })
+                send_disconnect_once(&event_tx, &disconnect_sent, format!("WS read error: {e}"))
                     .await;
                 break;
             }
@@ -1277,6 +1325,8 @@ async fn ws_write_loop(
     shutdown: Arc<AtomicBool>,
     heartbeat_interval_ms: f64,
     ws_sequence: Arc<AtomicI32>,
+    event_tx: mpsc::Sender<VoiceEvent>,
+    disconnect_sent: Arc<AtomicBool>,
 ) {
     let hb_dur = Duration::from_millis(heartbeat_interval_ms as u64);
     let mut hb_interval = time::interval(hb_dur);
@@ -1312,19 +1362,37 @@ async fn ws_write_loop(
                         }
                     })
                 };
-                if ws_write.send(Message::Text(hb.to_string())).await.is_err() {
+                if let Err(error) = ws_write.send(Message::Text(hb.to_string())).await {
+                    send_disconnect_once(
+                        &event_tx,
+                        &disconnect_sent,
+                        format!("WS heartbeat send failed: {error}"),
+                    )
+                    .await;
                     break;
                 }
             }
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(WsCommand::SendJson(v)) => {
-                        if ws_write.send(Message::Text(v.to_string())).await.is_err() {
+                        if let Err(error) = ws_write.send(Message::Text(v.to_string())).await {
+                            send_disconnect_once(
+                                &event_tx,
+                                &disconnect_sent,
+                                format!("WS command send failed: {error}"),
+                            )
+                            .await;
                             break;
                         }
                     }
                     Some(WsCommand::SendBinary(data)) => {
-                        if ws_write.send(Message::Binary(data)).await.is_err() {
+                        if let Err(error) = ws_write.send(Message::Binary(data)).await {
+                            send_disconnect_once(
+                                &event_tx,
+                                &disconnect_sent,
+                                format!("WS binary send failed: {error}"),
+                            )
+                            .await;
                             break;
                         }
                     }
@@ -1337,6 +1405,7 @@ async fn ws_write_loop(
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 async fn udp_recv_loop(
     socket: Arc<UdpSocket>,
     crypto: Arc<TransportCrypto>,
@@ -1345,6 +1414,7 @@ async fn udp_recv_loop(
     event_tx: mpsc::Sender<VoiceEvent>,
     ws_cmd_tx: mpsc::Sender<WsCommand>,
     shutdown: Arc<AtomicBool>,
+    disconnect_sent: Arc<AtomicBool>,
 ) {
     let mut buf = [0u8; 2048];
     loop {
@@ -1354,8 +1424,12 @@ async fn udp_recv_loop(
         let n = match socket.recv(&mut buf).await {
             Ok(n) => n,
             Err(e) => {
-                debug!("UDP recv error: {e}");
-                continue;
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+                send_disconnect_once(&event_tx, &disconnect_sent, format!("UDP recv error: {e}"))
+                    .await;
+                break;
             }
         };
         let packet = &buf[..n];

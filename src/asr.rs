@@ -15,6 +15,7 @@ pub(crate) enum AsrCommand {
     Audio(Vec<u8>),
     Commit,
     Clear,
+    Shutdown,
 }
 
 fn insert_optional_transcription_field(
@@ -95,7 +96,11 @@ pub(crate) async fn run_asr_client(
 
     loop {
         tokio::select! {
-            Some(cmd) = rx.recv() => {
+            cmd = rx.recv() => {
+                let Some(cmd) = cmd else {
+                    let _ = write.close().await;
+                    break;
+                };
                 match cmd {
                     AsrCommand::Audio(pcm) => {
                         let b64 = STANDARD.encode(&pcm);
@@ -118,6 +123,10 @@ pub(crate) async fn run_asr_client(
                             "type": "input_audio_buffer.clear"
                         });
                         let _ = write.send(Message::Text(clear_msg.to_string())).await;
+                    }
+                    AsrCommand::Shutdown => {
+                        let _ = write.close().await;
+                        break;
                     }
                 }
             }
@@ -150,7 +159,6 @@ pub(crate) async fn run_asr_client(
                     }
                 }
             }
-            else => break,
         }
     }
 

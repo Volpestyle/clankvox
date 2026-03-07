@@ -19,6 +19,7 @@ use base64::Engine as _;
 use crossbeam_channel as crossbeam;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
@@ -33,9 +34,8 @@ use crate::capture::{
 };
 use crate::dave::DaveManager;
 use crate::ipc::{
-    default_sample_rate, default_silence_duration, send_buffer_depth, send_error,
-    send_gateway_voice_state_update, send_msg, send_tts_playback_state, spawn_ipc_reader,
-    spawn_ipc_writer, ErrorCode, InMsg, OutMsg,
+    send_buffer_depth, send_error, send_gateway_voice_state_update, send_msg,
+    send_tts_playback_state, spawn_ipc_reader, spawn_ipc_writer, ErrorCode, InMsg, OutMsg,
 };
 use crate::music::{
     drain_music_pcm_queue, is_music_output_drained, start_music_pipeline, MusicEvent,
@@ -83,6 +83,20 @@ struct PendingConnection {
     token: Option<String>,
     session_id: Option<String>,
     user_id: Option<u64>,
+}
+
+struct AsrSession {
+    session_id: u64,
+    tx: mpsc::UnboundedSender<AsrCommand>,
+    handle: JoinHandle<()>,
+}
+
+fn shutdown_asr_session(session: AsrSession) {
+    let _ = session.tx.send(AsrCommand::Shutdown);
+    let handle = session.handle;
+    tokio::spawn(async move {
+        let _ = time::timeout(Duration::from_secs(2), handle).await;
+    });
 }
 
 fn parse_user_id_field(user_id: &str, context: &str) -> Option<u64> {
@@ -157,11 +171,10 @@ async fn main() {
     // SSRC → user_id mapping (mirrored from voice_conn's Speaking events)
     let mut ssrc_map: HashMap<u32, u64> = HashMap::new();
     let mut self_user_id: Option<u64> = None;
-    let mut default_recv_sample_rate = default_sample_rate();
-    let mut default_silence_duration_ms = default_silence_duration();
     let mut user_capture_states: HashMap<u64, UserCaptureState> = HashMap::new();
-    let mut asr_txs: HashMap<u64, mpsc::UnboundedSender<AsrCommand>> = HashMap::new();
-    let (asr_exit_tx, mut asr_exit_rx) = mpsc::channel::<(u64, String)>(32);
+    let mut asr_sessions: HashMap<u64, AsrSession> = HashMap::new();
+    let (asr_exit_tx, mut asr_exit_rx) = mpsc::channel::<(u64, u64, String)>(32);
+    let mut next_asr_session_id: u64 = 1;
     let mut speaking_states: HashMap<u64, SpeakingState> = HashMap::new();
 
     // Buffer depth reporting: emit every 25 ticks (500ms) while buffered, and
@@ -382,19 +395,20 @@ async fn main() {
                         silence_duration_ms,
                         sample_rate,
                     } => {
-                        default_recv_sample_rate = normalize_sample_rate(sample_rate);
-                        default_silence_duration_ms = normalize_silence_duration_ms(silence_duration_ms);
                         let Some(uid) = parse_user_id_field(&user_id, "subscribe_user") else {
                             continue;
                         };
+                        let normalized_sample_rate = normalize_sample_rate(sample_rate);
+                        let normalized_silence_duration_ms =
+                            normalize_silence_duration_ms(silence_duration_ms);
                         let state = user_capture_states.entry(uid).or_insert_with(|| {
                             UserCaptureState::new(
-                                default_recv_sample_rate,
-                                default_silence_duration_ms,
+                                normalized_sample_rate,
+                                normalized_silence_duration_ms,
                             )
                         });
-                        state.sample_rate = default_recv_sample_rate;
-                        state.silence_duration_ms = default_silence_duration_ms;
+                        state.sample_rate = normalized_sample_rate;
+                        state.silence_duration_ms = normalized_silence_duration_ms;
                     }
 
                     InMsg::UnsubscribeUser { user_id } => {
@@ -533,14 +547,16 @@ async fn main() {
                             continue;
                         };
 
-                        // Drop any existing ASR channel for this user before creating a new one
-                        asr_txs.remove(&uid);
+                        if let Some(session) = asr_sessions.remove(&uid) {
+                            shutdown_asr_session(session);
+                        }
 
                         let (asr_tx, asr_rx) = tokio::sync::mpsc::unbounded_channel();
-                        asr_txs.insert(uid, asr_tx);
+                        let session_id = next_asr_session_id;
+                        next_asr_session_id = next_asr_session_id.saturating_add(1);
 
                         let exit_tx = asr_exit_tx.clone();
-                        tokio::spawn(async move {
+                        let handle = tokio::spawn(async move {
                             let reason = match run_asr_client(user_id.clone(), api_key, model, language, prompt, asr_rx).await {
                                 Ok(()) => "closed".to_string(),
                                 Err(e) => {
@@ -548,23 +564,33 @@ async fn main() {
                                     format!("{e}")
                                 }
                             };
-                            let _ = exit_tx.send((uid, reason)).await;
+                            let _ = exit_tx.send((uid, session_id, reason)).await;
                         });
+                        asr_sessions.insert(
+                            uid,
+                            AsrSession {
+                                session_id,
+                                tx: asr_tx,
+                                handle,
+                            },
+                        );
                     }
 
                     InMsg::DisconnectAsr { user_id } => {
                         let Some(uid) = parse_user_id_field(&user_id, "disconnect_asr") else {
                             continue;
                         };
-                        asr_txs.remove(&uid);
+                        if let Some(session) = asr_sessions.remove(&uid) {
+                            shutdown_asr_session(session);
+                        }
                     }
 
                     InMsg::CommitAsr { user_id } => {
                         let Some(uid) = parse_user_id_field(&user_id, "commit_asr") else {
                             continue;
                         };
-                        if let Some(tx) = asr_txs.get(&uid) {
-                            let _ = tx.send(AsrCommand::Commit);
+                        if let Some(session) = asr_sessions.get(&uid) {
+                            let _ = session.tx.send(AsrCommand::Commit);
                         }
                     }
 
@@ -572,13 +598,16 @@ async fn main() {
                         let Some(uid) = parse_user_id_field(&user_id, "clear_asr") else {
                             continue;
                         };
-                        if let Some(tx) = asr_txs.get(&uid) {
-                            let _ = tx.send(AsrCommand::Clear);
+                        if let Some(session) = asr_sessions.get(&uid) {
+                            let _ = session.tx.send(AsrCommand::Clear);
                         }
                     }
 
                     InMsg::Destroy => {
                         music.stop_player();
+                        for (_, session) in asr_sessions.drain() {
+                            shutdown_asr_session(session);
+                        }
                         if let Some(ref conn) = voice_conn {
                             conn.shutdown();
                         }
@@ -644,7 +673,9 @@ async fn main() {
                         }
 
                         // Close ASR
-                        asr_txs.remove(&user_id);
+                        if let Some(session) = asr_sessions.remove(&user_id) {
+                            shutdown_asr_session(session);
+                        }
 
                         send_msg(&OutMsg::ClientDisconnect { user_id: uid_str });
                     }
@@ -658,15 +689,11 @@ async fn main() {
                             continue; // skip bot's own audio
                         }
 
-                        let target_sample_rate = user_capture_states
-                            .entry(uid)
-                            .or_insert_with(|| {
-                                UserCaptureState::new(
-                                    default_recv_sample_rate,
-                                    default_silence_duration_ms,
-                                )
-                            })
-                            .sample_rate;
+                        let Some(state) = user_capture_states.get(&uid) else {
+                            continue;
+                        };
+
+                        let target_sample_rate = state.sample_rate;
 
                         // Opus decode → stereo i16 48kHz
                         let mut pcm_stereo = vec![0i16; 5760]; // max Opus frame
@@ -686,13 +713,19 @@ async fn main() {
                         }
 
                         let decode_result = {
-                            let packet = OpusPacket::try_from(opus_frame.as_slice()).ok();
+                            let packet = match OpusPacket::try_from(opus_frame.as_slice()) {
+                                Ok(packet) => packet,
+                                Err(error) => {
+                                    debug!("Invalid Opus packet for ssrc={}: {:?}", ssrc, error);
+                                    continue;
+                                }
+                            };
                             let signals = MutSignals::try_from(pcm_stereo.as_mut_slice())
                                 .expect("non-empty signal buffer");
                             opus_decoders
                                 .get_mut(&ssrc)
                                 .expect("decoder inserted above")
-                                .decode(packet, signals, false)
+                                .decode(Some(packet), signals, false)
                         };
                         match decode_result {
                             Ok(samples_per_channel) => {
@@ -716,8 +749,8 @@ async fn main() {
                                 let (llm_pcm, peak, active, total) = convert_decoded_to_llm(decoded, target_sample_rate);
                                 if !llm_pcm.is_empty() {
                                     // Send to ASR first (clone only when ASR is active)
-                                    if let Some(asr_tx) = asr_txs.get(&uid) {
-                                        let _ = asr_tx.send(AsrCommand::Audio(llm_pcm.clone()));
+                                    if let Some(session) = asr_sessions.get(&uid) {
+                                        let _ = session.tx.send(AsrCommand::Audio(llm_pcm.clone()));
                                     }
 
                                     send_msg(&OutMsg::UserAudio {
@@ -745,9 +778,13 @@ async fn main() {
 
                     VoiceEvent::Disconnected { reason } => {
                         warn!("Voice disconnected: {}", reason);
+                        send_error(ErrorCode::VoiceRuntimeError, reason.clone());
                         send_msg(&OutMsg::ConnectionState { status: "disconnected".into() });
                         music.reset();
                         drain_music_pcm_queue(&music_pcm_rx);
+                        if let Some(ref conn) = voice_conn {
+                            conn.shutdown();
+                        }
                         voice_conn = None;
                         *audio_send_state.lock() = None;
                         ssrc_map.clear();
@@ -763,10 +800,6 @@ async fn main() {
                         );
                     }
 
-                    VoiceEvent::Error { message } => {
-                        error!("Voice connection error: {}", message);
-                        send_error(ErrorCode::VoiceRuntimeError, message);
-                    }
                 }
             }
 
@@ -825,18 +858,18 @@ async fn main() {
             }
 
             // ---- ASR task exit notification ----
-            Some((uid, reason)) = asr_exit_rx.recv() => {
-                // Clean up stale sender — only if it's still the same sender
-                // (a new ConnectAsr may have already replaced it)
-                if let Some(tx) = asr_txs.get(&uid) {
-                    if tx.is_closed() {
-                        asr_txs.remove(&uid);
-                    }
+            Some((uid, session_id, reason)) = asr_exit_rx.recv() => {
+                let is_current_session = asr_sessions
+                    .get(&uid)
+                    .is_some_and(|session| session.session_id == session_id);
+
+                if is_current_session {
+                    asr_sessions.remove(&uid);
+                    send_msg(&OutMsg::AsrDisconnected {
+                        user_id: uid.to_string(),
+                        reason,
+                    });
                 }
-                send_msg(&OutMsg::AsrDisconnected {
-                    user_id: uid.to_string(),
-                    reason,
-                });
             }
 
             () = async {

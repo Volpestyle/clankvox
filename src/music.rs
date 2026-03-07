@@ -9,7 +9,7 @@ use crossbeam_channel as crossbeam;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio::time;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{clear_audio_send_buffer, AudioSendState};
 
@@ -111,21 +111,28 @@ pub(crate) struct MusicPlayer {
 ///   so the child processes can clean up.
 /// - The guard `if pid == 0 { return; }` prevents signaling PID 0, which
 ///   would signal the calling process's own group.
-fn kill_music_process_group(pid: u32, signal: libc::c_int) {
+fn kill_music_process_group(pid: u32, signal: libc::c_int) -> io::Result<()> {
     if pid == 0 {
-        return;
+        return Ok(());
     }
     // SAFETY: All invariants documented above are upheld by the caller.
     // `pid` originates from `Child::id()`, the child uses `.process_group(0)`,
     // and we guard against pid==0.
     #[allow(unsafe_code, clippy::cast_possible_wrap)]
-    unsafe {
-        libc::killpg(pid as libc::pid_t, signal);
+    let rc = unsafe { libc::killpg(pid as libc::pid_t, signal) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 
 fn terminate_music_child(child: &mut std::process::Child, signal: libc::c_int) {
-    kill_music_process_group(child.id(), signal);
+    if let Err(error) = kill_music_process_group(child.id(), signal) {
+        if error.kind() != io::ErrorKind::NotFound {
+            warn!(pid = child.id(), error = %error, "failed to signal music process group");
+        }
+    }
 }
 
 impl MusicPlayer {
@@ -279,10 +286,15 @@ impl MusicPlayer {
 
     pub(crate) fn stop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        let pid = self.child_pid.load(Ordering::SeqCst);
-        kill_music_process_group(pid, libc::SIGTERM);
-        self.child_pid.store(0, Ordering::SeqCst);
         if let Some(thread) = self.thread.take() {
+            if !thread.is_finished() {
+                let pid = self.child_pid.load(Ordering::SeqCst);
+                if let Err(error) = kill_music_process_group(pid, libc::SIGTERM) {
+                    if error.kind() != io::ErrorKind::NotFound {
+                        warn!(pid, error = %error, "failed to stop music process group");
+                    }
+                }
+            }
             if thread.is_finished() {
                 let _ = thread.join();
             } else {
