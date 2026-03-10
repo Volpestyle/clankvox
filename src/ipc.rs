@@ -399,7 +399,10 @@ pub fn spawn_ipc_reader(audio_debug: bool) -> InboundIpc {
         let _ = control_tx.send(InMsg::Destroy);
     });
 
-    InboundIpc { control_rx, audio_rx }
+    InboundIpc {
+        control_rx,
+        audio_rx,
+    }
 }
 
 pub fn spawn_ipc_writer() {

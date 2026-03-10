@@ -7,10 +7,10 @@ use tokio::time;
 
 use crate::app_state::AppState;
 use crate::capture::{
-    normalize_sample_rate, normalize_silence_duration_ms, SpeakingState, UserCaptureState,
-    SPEAKING_TIMEOUT_MS,
+    SPEAKING_TIMEOUT_MS, SpeakingState, UserCaptureState, normalize_sample_rate,
+    normalize_silence_duration_ms,
 };
-use crate::ipc::{send_msg, OutMsg};
+use crate::ipc::{OutMsg, send_msg};
 use crate::ipc_protocol::CaptureCommand;
 use crate::voice_conn::VoiceEvent;
 
@@ -248,7 +248,11 @@ mod tests {
         let mut speaking_states: HashMap<u64, SpeakingState> = HashMap::new();
         let first_packet_at = time::Instant::now();
 
-        assert!(update_speaking_state(&mut speaking_states, 42, first_packet_at));
+        assert!(update_speaking_state(
+            &mut speaking_states,
+            42,
+            first_packet_at
+        ));
         assert!(!update_speaking_state(
             &mut speaking_states,
             42,

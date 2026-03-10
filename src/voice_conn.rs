@@ -1,23 +1,23 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::time::Duration;
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time;
-use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::MaybeTlsStream;
+use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::dave::DaveManager;
@@ -732,7 +732,10 @@ async fn recv_ready(
                     } = payload;
                     return Ok((ssrc, ip, port, modes));
                 }
-                debug!("Handshake (waiting OP2): buffered text op={op}", op = message.op);
+                debug!(
+                    "Handshake (waiting OP2): buffered text op={op}",
+                    op = message.op
+                );
                 overflow.push(msg);
             }
             Message::Binary(data) => {
@@ -767,7 +770,10 @@ async fn recv_session_description(
                         .context("invalid session description payload")?;
                     return Ok((payload.secret_key, payload.dave_protocol_version));
                 }
-                debug!("Handshake (waiting OP4): buffered text op={op}", op = message.op);
+                debug!(
+                    "Handshake (waiting OP4): buffered text op={op}",
+                    op = message.op
+                );
                 overflow.push(msg);
             }
             Message::Binary(data) => {
@@ -965,7 +971,9 @@ async fn handle_text_opcode(
             if transitioned {
                 let ready = {
                     let guard = dave.lock();
-                    guard.as_ref().is_some_and(super::dave::DaveManager::is_ready)
+                    guard
+                        .as_ref()
+                        .is_some_and(super::dave::DaveManager::is_ready)
                 };
                 if ready {
                     let _ = event_tx.send(VoiceEvent::DaveReady).await;
@@ -1606,9 +1614,9 @@ mod tests {
     use futures_util::stream;
 
     use super::{
-        build_rtp_header, parse_rtp_header, parse_user_id, parse_voice_opcode, recv_ready,
-        recv_session_description, HelloPayload, SessionDescriptionPayload, TransportCrypto,
-        VoiceOpcode, OPUS_PT, RTP_HEADER_LEN,
+        HelloPayload, OPUS_PT, RTP_HEADER_LEN, SessionDescriptionPayload, TransportCrypto,
+        VoiceOpcode, build_rtp_header, parse_rtp_header, parse_user_id, parse_voice_opcode,
+        recv_ready, recv_session_description,
     };
     use tokio_tungstenite::tungstenite::Message;
 
@@ -1732,10 +1740,9 @@ mod tests {
         ]);
         let mut overflow = Vec::new();
 
-        let (secret_key, dave_protocol_version) =
-            recv_session_description(&mut ws, &mut overflow)
-                .await
-                .expect("session description payload");
+        let (secret_key, dave_protocol_version) = recv_session_description(&mut ws, &mut overflow)
+            .await
+            .expect("session description payload");
 
         assert_eq!(secret_key, vec![1, 2, 3, 4]);
         assert_eq!(dave_protocol_version, 1);

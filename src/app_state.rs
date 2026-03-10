@@ -11,8 +11,8 @@ use tracing::warn;
 use crate::audio_pipeline::AudioSendState;
 use crate::capture::{SpeakingState, UserCaptureState};
 use crate::dave::DaveManager;
-use crate::ipc::{send_error, send_gateway_voice_state_update, send_msg, ErrorCode, OutMsg};
-use crate::music::{drain_music_pcm_queue, MusicEvent, MusicState};
+use crate::ipc::{ErrorCode, OutMsg, send_error, send_gateway_voice_state_update, send_msg};
+use crate::music::{MusicEvent, MusicState, drain_music_pcm_queue};
 use crate::voice_conn::{VoiceConnection, VoiceEvent};
 
 pub(crate) fn schedule_reconnect(

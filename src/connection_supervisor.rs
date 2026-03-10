@@ -17,7 +17,11 @@ impl AppState {
         self.apply_connect_outcome(outcome, failure_reason);
     }
 
-    pub(crate) fn apply_connect_outcome(&mut self, outcome: TryConnectOutcome, failure_reason: &str) {
+    pub(crate) fn apply_connect_outcome(
+        &mut self,
+        outcome: TryConnectOutcome,
+        failure_reason: &str,
+    ) {
         match outcome {
             TryConnectOutcome::Connected => self.reset_reconnect(),
             TryConnectOutcome::Failed => self.schedule_reconnect(failure_reason),
@@ -50,7 +54,10 @@ impl AppState {
 
         tracing::info!(
             "Connecting to voice: endpoint={:?} guild={} channel={} user={}",
-            self.pending_conn.endpoint, gid, cid, uid
+            self.pending_conn.endpoint,
+            gid,
+            cid,
+            uid
         );
 
         match VoiceConnection::connect(
@@ -122,7 +129,11 @@ impl AppState {
                 self.reset_reconnect();
 
                 crate::ipc::send_gateway_voice_state_update(guild_id, channel_id, self_mute);
-                tracing::info!("Join requested guild={} channel={}, sent OP4", guild_id, channel_id);
+                tracing::info!(
+                    "Join requested guild={} channel={}, sent OP4",
+                    guild_id,
+                    channel_id
+                );
             }
             ConnectionCommand::VoiceServer { data } => {
                 let endpoint = data.endpoint.clone();
@@ -159,7 +170,9 @@ impl AppState {
                 );
 
                 if let Some(ref session_id) = new_session_id {
-                    if self.voice_conn.is_some() && old_session_id.as_deref() != Some(session_id.as_str()) {
+                    if self.voice_conn.is_some()
+                        && old_session_id.as_deref() != Some(session_id.as_str())
+                    {
                         tracing::warn!(
                             "Session ID changed while connected: {:?} -> {:?}, tearing down for reconnect",
                             old_session_id,
