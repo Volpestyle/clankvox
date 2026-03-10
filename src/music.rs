@@ -2,8 +2,8 @@ use std::collections::VecDeque;
 use std::io::{self, BufRead};
 use std::os::unix::process::CommandExt;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crossbeam_channel as crossbeam;
 use parking_lot::Mutex;
@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use tokio::time;
 use tracing::{info, warn};
 
-use crate::audio_pipeline::{clear_audio_send_buffer, AudioSendState};
+use crate::audio_pipeline::{AudioSendState, clear_audio_send_buffer};
 
 const MUSIC_PIPELINE_STDERR_TAIL_LINES: usize = 24;
 
@@ -92,6 +92,7 @@ pub(crate) fn start_music_pipeline(
 
 pub(crate) struct MusicPlayer {
     stop: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
     child_pid: Arc<AtomicU32>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -107,8 +108,9 @@ pub(crate) struct MusicPlayer {
 /// - The child was spawned with `.process_group(0)` (see `MusicPlayer::start`),
 ///   which places the shell pipeline (sh + yt-dlp + ffmpeg) in its own process
 ///   group whose PGID equals the child PID.
-/// - We only call this with `SIGTERM` (graceful shutdown), never `SIGKILL`,
-///   so the child processes can clean up.
+/// - Callers only use process-group signals that are valid for the music
+///   pipeline lifecycle: `SIGTERM` for shutdown plus `SIGSTOP` / `SIGCONT`
+///   for in-place pause and resume. We never send `SIGKILL`.
 /// - The guard `if pid == 0 { return; }` prevents signaling PID 0, which
 ///   would signal the calling process's own group.
 fn kill_music_process_group(pid: u32, signal: libc::c_int) -> io::Result<()> {
@@ -145,6 +147,8 @@ impl MusicPlayer {
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = stop.clone();
+        let paused = Arc::new(AtomicBool::new(false));
+        let paused_thread = paused.clone();
         let child_pid = Arc::new(AtomicU32::new(0));
         let child_pid_thread = child_pid.clone();
         let url = url.to_string();
@@ -245,6 +249,7 @@ impl MusicPlayer {
                 let _ = handle.join();
             }
             child_pid_thread.store(0, Ordering::SeqCst);
+            paused_thread.store(false, Ordering::SeqCst);
 
             let stderr_summary = {
                 let tail = stderr_tail.lock();
@@ -279,16 +284,71 @@ impl MusicPlayer {
 
         MusicPlayer {
             stop,
+            paused,
             child_pid,
             thread: Some(thread),
         }
     }
 
+    pub(crate) fn is_alive(&self) -> bool {
+        self.child_pid.load(Ordering::SeqCst) != 0
+    }
+
+    pub(crate) fn pause(&self) -> bool {
+        if self.paused.load(Ordering::SeqCst) {
+            return self.is_alive();
+        }
+        let pid = self.child_pid.load(Ordering::SeqCst);
+        if pid == 0 {
+            return false;
+        }
+        match kill_music_process_group(pid, libc::SIGSTOP) {
+            Ok(()) => {
+                self.paused.store(true, Ordering::SeqCst);
+                true
+            }
+            Err(error) => {
+                if error.kind() != io::ErrorKind::NotFound {
+                    warn!(pid, error = %error, "failed to pause music process group");
+                }
+                false
+            }
+        }
+    }
+
+    pub(crate) fn resume(&self) -> bool {
+        if !self.paused.load(Ordering::SeqCst) {
+            return self.is_alive();
+        }
+        let pid = self.child_pid.load(Ordering::SeqCst);
+        if pid == 0 {
+            self.paused.store(false, Ordering::SeqCst);
+            return false;
+        }
+        match kill_music_process_group(pid, libc::SIGCONT) {
+            Ok(()) => {
+                self.paused.store(false, Ordering::SeqCst);
+                true
+            }
+            Err(error) => {
+                if error.kind() != io::ErrorKind::NotFound {
+                    warn!(pid, error = %error, "failed to resume music process group");
+                }
+                false
+            }
+        }
+    }
+
     pub(crate) fn stop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
+        let was_paused = self.paused.swap(false, Ordering::SeqCst);
         if let Some(thread) = self.thread.take() {
             if !thread.is_finished() {
                 let pid = self.child_pid.load(Ordering::SeqCst);
+                // A SIGSTOP'd process won't handle SIGTERM until continued.
+                if was_paused {
+                    let _ = kill_music_process_group(pid, libc::SIGCONT);
+                }
                 if let Err(error) = kill_music_process_group(pid, libc::SIGTERM) {
                     if error.kind() != io::ErrorKind::NotFound {
                         warn!(pid, error = %error, "failed to stop music process group");
