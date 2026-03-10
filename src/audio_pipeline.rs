@@ -93,17 +93,18 @@ impl AudioSendState {
 
     pub(crate) fn push_pcm(&mut self, samples: Vec<i16>) {
         self.pcm_buffer.extend(samples);
-        // Drop oldest samples to keep the buffer bounded (prevents runaway latency)
+        // Drop newest samples to keep the buffer bounded without skipping ahead
+        // through speech that is already queued for playback.
         if self.pcm_buffer.len() > MAX_PCM_BUFFER_SAMPLES {
             let overflow = self.pcm_buffer.len() - MAX_PCM_BUFFER_SAMPLES;
             warn!(
-                "TTS PCM buffer overflow: dropping {} oldest samples ({:.1}ms), buffer was {} samples ({:.1}ms)",
+                "TTS PCM buffer overflow: dropping {} newest samples ({:.1}ms), buffer was {} samples ({:.1}ms)",
                 overflow,
                 overflow as f64 / 48.0,
                 self.pcm_buffer.len(),
                 self.pcm_buffer.len() as f64 / 48.0
             );
-            self.pcm_buffer.drain(..overflow);
+            self.pcm_buffer.truncate(MAX_PCM_BUFFER_SAMPLES);
         }
         self.trailing_silence_frames = 0;
         self.partial_tts_stall_ticks = 0;
@@ -419,7 +420,7 @@ pub(crate) fn emit_playback_armed(
 
 #[cfg(test)]
 mod tests {
-    use super::AudioSendState;
+    use super::{AudioSendState, MAX_PCM_BUFFER_SAMPLES};
 
     #[test]
     fn tts_partial_tail_flushes_after_short_stall() {
@@ -484,5 +485,16 @@ mod tests {
         assert_eq!(state.tts_buffer_samples(), 480);
         assert_eq!(state.music_buffer_samples(), 0);
         assert!(!state.is_music_output_suppressed());
+    }
+
+    #[test]
+    fn tts_overflow_drops_newest_tail_instead_of_skipping_buffered_speech() {
+        let mut state = AudioSendState::new().expect("audio state");
+        state.push_pcm(vec![111; MAX_PCM_BUFFER_SAMPLES]);
+        state.push_pcm(vec![222; 960]);
+
+        assert_eq!(state.tts_buffer_samples(), MAX_PCM_BUFFER_SAMPLES);
+        assert_eq!(state.pcm_buffer.front().copied(), Some(111));
+        assert_eq!(state.pcm_buffer.back().copied(), Some(111));
     }
 }
