@@ -1,8 +1,13 @@
 use base64::Engine as _;
 use tokio::time;
+use tracing::{info, warn};
 
 use crate::app_state::AppState;
-use crate::audio_pipeline::{clear_audio_send_buffer, clear_tts_send_buffer, convert_llm_to_48k_mono, emit_playback_armed};
+use crate::audio_pipeline::{
+    clear_audio_send_buffer, clear_music_send_buffer, clear_tts_send_buffer,
+    convert_llm_to_48k_mono, emit_playback_armed, has_buffered_music_output, resume_music_output,
+    suppress_music_output,
+};
 use crate::ipc::{OutMsg, send_buffer_depth, send_msg, send_tts_playback_state};
 use crate::ipc_protocol::PlaybackCommand;
 use crate::music::{MusicEvent, drain_music_pcm_queue, is_music_output_drained};
@@ -88,6 +93,7 @@ impl AppState {
                     return false;
                 }
 
+                clear_music_send_buffer(&self.audio_send_state);
                 self.music
                     .queue_pending_start(normalized_url.clone(), resolved_direct_url);
                 self.start_music_pipeline(&normalized_url, resolved_direct_url, false);
@@ -125,11 +131,32 @@ impl AppState {
                 self.music.clear_pending_start();
                 self.music.pending_stop = false;
                 let was_finishing = self.music.finishing;
-                self.music.finishing = false;
-                if self.music.player.is_some() || self.music.active || was_finishing {
+                let player_alive = self
+                    .music
+                    .player
+                    .as_ref()
+                    .is_some_and(crate::music::MusicPlayer::is_alive);
+                let buffered_music_output = !self.music_pcm_rx.is_empty()
+                    || has_buffered_music_output(&self.audio_send_state);
+                if player_alive || self.music.active || was_finishing {
+                    info!(
+                        "music_pause: player_alive={} active={} was_finishing={} buffered_output={}",
+                        player_alive, self.music.active, was_finishing, buffered_music_output
+                    );
+                    if player_alive
+                        && !self
+                            .music
+                            .player
+                            .as_ref()
+                            .is_some_and(crate::music::MusicPlayer::pause)
+                    {
+                        warn!("music_pause: failed to pause music process group");
+                    }
                     self.music.paused = true;
                     self.music.active = false;
-                    clear_audio_send_buffer(&self.audio_send_state);
+                    self.music.finishing =
+                        was_finishing || (!player_alive && buffered_music_output);
+                    suppress_music_output(&self.audio_send_state);
                     send_msg(&OutMsg::PlayerState {
                         status: "paused".into(),
                     });
@@ -142,19 +169,53 @@ impl AppState {
                 self.music.pending_stop = false;
                 self.music.finishing = false;
 
-                if self.music.player.is_some() {
+                let player_alive = self
+                    .music
+                    .player
+                    .as_ref()
+                    .is_some_and(crate::music::MusicPlayer::is_alive);
+                let resumed_in_place = player_alive
+                    && self
+                        .music
+                        .player
+                        .as_ref()
+                        .is_some_and(crate::music::MusicPlayer::resume);
+                let buffered_music_output = !self.music_pcm_rx.is_empty()
+                    || has_buffered_music_output(&self.audio_send_state);
+
+                if resumed_in_place {
+                    info!("music_resume: player alive, resuming from position");
+                    resume_music_output(&self.audio_send_state);
                     self.music.paused = false;
                     self.music.active = true;
                     send_msg(&OutMsg::PlayerState {
                         status: "playing".into(),
                     });
+                } else if !player_alive && buffered_music_output {
+                    info!(
+                        "music_resume: player dead, resuming buffered output from current position"
+                    );
+                    resume_music_output(&self.audio_send_state);
+                    self.music.paused = false;
+                    self.music.active = true;
+                    self.music.finishing = true;
+                    send_msg(&OutMsg::PlayerState {
+                        status: "playing".into(),
+                    });
                 } else if let Some(url) = self.music.active_url.clone() {
+                    self.music.stop_player();
+                    warn!(
+                        "music_resume: player dead, restarting pipeline from url={}",
+                        url
+                    );
                     self.start_music_pipeline(&url, self.music.active_resolved_direct_url, true);
                     self.music.paused = false;
                     self.music.active = true;
                     send_msg(&OutMsg::PlayerState {
                         status: "playing".into(),
                     });
+                } else {
+                    warn!("music_resume: no player and no url, cannot resume");
                 }
                 false
             }
@@ -180,6 +241,10 @@ impl AppState {
     pub(crate) fn handle_music_event(&mut self, event: MusicEvent) {
         match event {
             MusicEvent::Idle => {
+                info!(
+                    "music_event_idle: active={} paused={} finishing={}",
+                    self.music.active, self.music.paused, self.music.finishing
+                );
                 self.music.stop_player();
                 self.music.paused = false;
                 self.music.finishing = self.music.active;
@@ -267,9 +332,10 @@ impl AppState {
                             .as_ref()
                             .is_none_or(crate::audio_pipeline::AudioSendState::tts_is_empty)
                     };
-                    let drain_elapsed_ms = self.music.pending_drain_started_at.map_or(0, |started| {
-                        now.duration_since(started).as_millis() as u64
-                    });
+                    let drain_elapsed_ms = self
+                        .music
+                        .pending_drain_started_at
+                        .map_or(0, |started| now.duration_since(started).as_millis() as u64);
                     if audio_buffer_empty {
                         start_music = true;
                         reason = "pending_announcement_drain_complete";
@@ -396,15 +462,20 @@ impl AppState {
         self.tick_pending_music_start(now);
 
         if self.music.active && !self.music.paused {
-            while let Ok(chunk) = self.music_pcm_rx.try_recv() {
-                let mut guard = self.audio_send_state.lock();
-                if let Some(ref mut state) = *guard {
+            let mut guard = self.audio_send_state.lock();
+            if let Some(ref mut state) = *guard {
+                while state.can_accept_music_chunk() {
+                    let Ok(chunk) = self.music_pcm_rx.try_recv() else {
+                        break;
+                    };
                     state.push_music_pcm(chunk);
                 }
             }
         }
 
-        if self.music.finishing && is_music_output_drained(&self.music_pcm_rx, &self.audio_send_state) {
+        if self.music.finishing
+            && is_music_output_drained(&self.music_pcm_rx, &self.audio_send_state)
+        {
             self.music.finishing = false;
             self.music.active = false;
             self.music.paused = false;
@@ -458,5 +529,115 @@ impl AppState {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crossbeam_channel as crossbeam;
+    use parking_lot::Mutex;
+    use tokio::sync::mpsc;
+
+    use super::AppState;
+    use crate::audio_pipeline::{AUDIO_FRAME_SAMPLES, AudioSendState, MAX_MUSIC_BUFFER_SAMPLES};
+    use crate::ipc_protocol::PlaybackCommand;
+
+    fn make_app_state_with_music_queue_capacity(queue_capacity: usize) -> AppState {
+        let (_voice_event_tx, voice_event_rx) = mpsc::channel(4);
+        drop(voice_event_rx);
+        let (music_event_tx, music_event_rx) = mpsc::channel(4);
+        drop(music_event_rx);
+
+        let audio_send_state = Arc::new(Mutex::new(Some(
+            AudioSendState::new().expect("audio state"),
+        )));
+        let (music_pcm_tx, music_pcm_rx) = crossbeam::bounded::<Vec<i16>>(queue_capacity);
+
+        AppState::new(
+            Arc::new(Mutex::new(None)),
+            _voice_event_tx,
+            audio_send_state,
+            music_pcm_tx,
+            music_pcm_rx,
+            music_event_tx,
+        )
+    }
+
+    fn make_app_state() -> AppState {
+        make_app_state_with_music_queue_capacity(4)
+    }
+
+    #[test]
+    fn wake_word_pause_preserves_buffered_music_tail_when_player_is_dead() {
+        let mut state = make_app_state();
+        {
+            let mut guard = state.audio_send_state.lock();
+            let audio_state = guard.as_mut().expect("audio state");
+            audio_state.push_music_pcm(vec![123; 960]);
+        }
+        state.music.active = true;
+        state.music.finishing = true;
+        state.music.active_url = Some("https://cdn.example.com/track.mp4".to_string());
+        state.music.active_resolved_direct_url = true;
+
+        assert!(!state.handle_playback_command(PlaybackCommand::MusicPause));
+        assert!(state.music.paused);
+        assert!(!state.music.active);
+        assert!(state.music.finishing);
+        {
+            let guard = state.audio_send_state.lock();
+            let audio_state = guard.as_ref().expect("audio state");
+            assert_eq!(audio_state.music_buffer_samples(), 960);
+            assert!(audio_state.is_music_output_suppressed());
+        }
+
+        assert!(!state.handle_playback_command(PlaybackCommand::MusicResume));
+        assert!(
+            state.music.player.is_none(),
+            "buffered resume should not restart the pipeline"
+        );
+        assert!(!state.music.paused);
+        assert!(state.music.active);
+        assert!(state.music.finishing);
+        {
+            let mut guard = state.audio_send_state.lock();
+            let audio_state = guard.as_mut().expect("audio state");
+            assert!(!audio_state.is_music_output_suppressed());
+            let frame = audio_state
+                .next_opus_frame()
+                .expect("buffered music should resume from preserved PCM");
+            assert!(!frame.is_empty());
+            assert_eq!(audio_state.music_buffer_samples(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn on_audio_tick_caps_music_prefetch_to_live_window() {
+        let mut state = make_app_state_with_music_queue_capacity(128);
+        state.music.active = true;
+
+        for _ in 0..128 {
+            state
+                .music_pcm_tx
+                .send(vec![321; AUDIO_FRAME_SAMPLES])
+                .expect("queue music chunk");
+        }
+
+        state.on_audio_tick().await;
+
+        {
+            let guard = state.audio_send_state.lock();
+            let audio_state = guard.as_ref().expect("audio state");
+            assert_eq!(
+                audio_state.music_buffer_samples(),
+                MAX_MUSIC_BUFFER_SAMPLES - AUDIO_FRAME_SAMPLES
+            );
+        }
+        assert!(
+            state.music_pcm_rx.len() > 0,
+            "backpressure should leave upstream music PCM queued instead of draining the full track"
+        );
     }
 }

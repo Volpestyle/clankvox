@@ -7,7 +7,7 @@ use audiopus::{Application, Channels, SampleRate};
 use parking_lot::Mutex;
 use tracing::{error, info, warn};
 
-use crate::ipc::{send_msg, OutMsg};
+use crate::ipc::{OutMsg, send_msg};
 
 struct GainEnvelope {
     current: f32,
@@ -55,7 +55,9 @@ impl GainEnvelope {
 }
 
 const MAX_TRAILING_SILENCE: u32 = 5; // 100ms of trailing silence
+pub(crate) const AUDIO_FRAME_SAMPLES: usize = 960; // 20ms @ 48kHz mono
 const MAX_PCM_BUFFER_SAMPLES: usize = 720_000; // 15 seconds @ 48kHz mono
+pub(crate) const MAX_MUSIC_BUFFER_SAMPLES: usize = 96_000; // 2 seconds @ 48kHz mono
 const PARTIAL_TTS_FLUSH_TICKS: u32 = 2; // Flush an underfilled tail after 40ms of no growth
 
 pub(crate) struct AudioSendState {
@@ -63,6 +65,7 @@ pub(crate) struct AudioSendState {
     music_buffer: VecDeque<i16>, // Music audio (separate for mixing)
     music_gain: GainEnvelope,    // Gain envelope applied to music
     music_gain_notified: f32,    // Last gain value we sent MusicGainReached for
+    music_output_suppressed: bool,
     encoder: OpusEncoder,
     speaking: bool,
     trailing_silence_frames: u32,
@@ -80,6 +83,7 @@ impl AudioSendState {
             music_buffer: VecDeque::with_capacity(48_000),
             music_gain: GainEnvelope::new(1.0, 1.0, 0),
             music_gain_notified: 1.0,
+            music_output_suppressed: false,
             encoder,
             speaking: false,
             trailing_silence_frames: 0,
@@ -107,6 +111,19 @@ impl AudioSendState {
 
     pub(crate) fn push_music_pcm(&mut self, samples: Vec<i16>) {
         self.music_buffer.extend(samples);
+        self.trailing_silence_frames = 0;
+    }
+
+    pub(crate) fn can_accept_music_chunk(&self) -> bool {
+        self.music_buffer.len().saturating_add(AUDIO_FRAME_SAMPLES) <= MAX_MUSIC_BUFFER_SAMPLES
+    }
+
+    pub(crate) fn suppress_music_output(&mut self) {
+        self.music_output_suppressed = true;
+    }
+
+    pub(crate) fn resume_music_output(&mut self) {
+        self.music_output_suppressed = false;
         self.trailing_silence_frames = 0;
     }
 
@@ -162,9 +179,15 @@ impl AudioSendState {
         self.music_buffer.len()
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_music_output_suppressed(&self) -> bool {
+        self.music_output_suppressed
+    }
+
     fn clear(&mut self) {
         self.pcm_buffer.clear();
         self.music_buffer.clear();
+        self.music_output_suppressed = false;
         self.trailing_silence_frames = MAX_TRAILING_SILENCE;
         self.partial_tts_stall_ticks = 0;
     }
@@ -174,16 +197,21 @@ impl AudioSendState {
         self.partial_tts_stall_ticks = 0;
     }
 
-    /// Encode the next 20ms frame, mixing TTS and music buffers.
-    /// Music samples have the gain envelope applied. Returns None if idle.
-    pub(crate) fn next_opus_frame(&mut self) -> Option<Vec<u8>> {
-        const FRAME_SIZE: usize = 960; // 20ms @ 48kHz mono
+    fn clear_music(&mut self) {
+        self.music_buffer.clear();
+        self.music_output_suppressed = false;
+        self.trailing_silence_frames = MAX_TRAILING_SILENCE;
+    }
 
+    /// Encode the next 20ms frame, mixing TTS and music buffers.
+    /// Music samples have the gain envelope applied unless music output is
+    /// temporarily suppressed for a wake-word pause. Returns None if idle.
+    pub(crate) fn next_opus_frame(&mut self) -> Option<Vec<u8>> {
         let available_tts = self.pcm_buffer.len();
         let available_music = self.music_buffer.len();
-        let has_music = available_music >= FRAME_SIZE;
-        let has_full_tts = available_tts >= FRAME_SIZE;
-        let has_partial_tts = available_tts > 0 && available_tts < FRAME_SIZE;
+        let has_music = !self.music_output_suppressed && available_music >= AUDIO_FRAME_SAMPLES;
+        let has_full_tts = available_tts >= AUDIO_FRAME_SAMPLES;
+        let has_partial_tts = available_tts > 0 && available_tts < AUDIO_FRAME_SAMPLES;
 
         if has_full_tts {
             self.partial_tts_stall_ticks = 0;
@@ -196,7 +224,7 @@ impl AudioSendState {
         let flush_partial_tts = has_partial_tts
             && (has_music || self.partial_tts_stall_ticks >= PARTIAL_TTS_FLUSH_TICKS);
         let tts_samples_to_take = if has_full_tts {
-            FRAME_SIZE
+            AUDIO_FRAME_SAMPLES
         } else if flush_partial_tts {
             available_tts
         } else {
@@ -205,15 +233,15 @@ impl AudioSendState {
         let has_tts = tts_samples_to_take > 0;
 
         if has_tts || has_music {
-            let mut mixed = [0i32; FRAME_SIZE];
+            let mut mixed = [0i32; AUDIO_FRAME_SAMPLES];
 
             if has_music {
-                for (i, s) in self.music_buffer.drain(..FRAME_SIZE).enumerate() {
+                for (i, s) in self.music_buffer.drain(..AUDIO_FRAME_SAMPLES).enumerate() {
                     mixed[i] += self.music_gain.apply_sample(s) as i32;
                 }
             }
             if has_tts {
-                if flush_partial_tts && tts_samples_to_take < FRAME_SIZE {
+                if flush_partial_tts && tts_samples_to_take < AUDIO_FRAME_SAMPLES {
                     info!(
                         queued_samples = available_tts,
                         stall_ticks = self.partial_tts_stall_ticks,
@@ -348,6 +376,36 @@ pub(crate) fn clear_tts_send_buffer(audio_send_state: &Arc<Mutex<Option<AudioSen
     }
 }
 
+pub(crate) fn clear_music_send_buffer(audio_send_state: &Arc<Mutex<Option<AudioSendState>>>) {
+    let mut guard = audio_send_state.lock();
+    if let Some(ref mut state) = *guard {
+        state.clear_music();
+    }
+}
+
+pub(crate) fn suppress_music_output(audio_send_state: &Arc<Mutex<Option<AudioSendState>>>) {
+    let mut guard = audio_send_state.lock();
+    if let Some(ref mut state) = *guard {
+        state.suppress_music_output();
+    }
+}
+
+pub(crate) fn resume_music_output(audio_send_state: &Arc<Mutex<Option<AudioSendState>>>) {
+    let mut guard = audio_send_state.lock();
+    if let Some(ref mut state) = *guard {
+        state.resume_music_output();
+    }
+}
+
+pub(crate) fn has_buffered_music_output(
+    audio_send_state: &Arc<Mutex<Option<AudioSendState>>>,
+) -> bool {
+    let guard = audio_send_state.lock();
+    guard
+        .as_ref()
+        .is_some_and(|state| state.music_buffer_samples() > 0)
+}
+
 pub(crate) fn emit_playback_armed(
     reason: &str,
     audio_send_state: &Arc<Mutex<Option<AudioSendState>>>,
@@ -390,5 +448,41 @@ mod tests {
             .expect("full frame should encode once tail grows");
         assert!(!frame.is_empty());
         assert_eq!(state.tts_buffer_samples(), 0);
+    }
+
+    #[test]
+    fn suppressed_music_output_preserves_buffer_until_resumed() {
+        let mut state = AudioSendState::new().expect("audio state");
+        state.push_music_pcm(vec![123; 960]);
+        state.suppress_music_output();
+
+        for _ in 0..3 {
+            let _ = state.next_opus_frame();
+        }
+
+        assert_eq!(state.music_buffer_samples(), 960);
+        assert!(state.is_music_output_suppressed());
+
+        state.resume_music_output();
+        let frame = state
+            .next_opus_frame()
+            .expect("music frame should encode after resume");
+        assert!(!frame.is_empty());
+        assert_eq!(state.music_buffer_samples(), 0);
+        assert!(!state.is_music_output_suppressed());
+    }
+
+    #[test]
+    fn clear_music_preserves_tts_buffer() {
+        let mut state = AudioSendState::new().expect("audio state");
+        state.push_pcm(vec![123; 480]);
+        state.push_music_pcm(vec![456; 960]);
+        state.suppress_music_output();
+
+        state.clear_music();
+
+        assert_eq!(state.tts_buffer_samples(), 480);
+        assert_eq!(state.music_buffer_samples(), 0);
+        assert!(!state.is_music_output_suppressed());
     }
 }

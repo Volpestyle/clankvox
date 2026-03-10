@@ -26,6 +26,8 @@ use crate::ipc::{spawn_ipc_reader, spawn_ipc_writer};
 use crate::music::MusicEvent;
 use crate::voice_conn::VoiceEvent;
 
+const MUSIC_PCM_QUEUE_CAPACITY_CHUNKS: usize = 100; // ~2s of 20ms PCM chunks
+
 async fn reconnect_sleep(deadline: Option<time::Instant>) {
     match deadline {
         Some(deadline) => time::sleep_until(deadline).await,
@@ -65,7 +67,8 @@ async fn main() {
     send_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     send_interval.tick().await;
 
-    let (music_pcm_tx, music_pcm_rx) = crossbeam::bounded::<Vec<i16>>(500);
+    let (music_pcm_tx, music_pcm_rx) =
+        crossbeam::bounded::<Vec<i16>>(MUSIC_PCM_QUEUE_CAPACITY_CHUNKS);
     let (music_event_tx, mut music_event_rx) = tokio::sync::mpsc::channel::<MusicEvent>(32);
 
     let mut state = AppState::new(
