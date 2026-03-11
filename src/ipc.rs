@@ -4,7 +4,7 @@ use crossbeam_channel as crossbeam;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[derive(Clone, Debug)]
 struct IpcSenders {
@@ -269,12 +269,21 @@ pub fn send_tts_playback_state(status: &str, reason: &str) {
 }
 
 pub fn send_buffer_depth(tts_samples: usize, music_samples: usize, reason: &str) {
-    info!(
-        tts_samples = tts_samples,
-        music_samples = music_samples,
-        reason = reason,
-        "clankvox_buffer_depth"
-    );
+    if matches!(reason, "periodic_nonempty" | "periodic_drained") {
+        debug!(
+            tts_samples = tts_samples,
+            music_samples = music_samples,
+            reason = reason,
+            "clankvox_buffer_depth"
+        );
+    } else {
+        info!(
+            tts_samples = tts_samples,
+            music_samples = music_samples,
+            reason = reason,
+            "clankvox_buffer_depth"
+        );
+    }
     send_msg(&OutMsg::BufferDepth {
         tts_samples,
         music_samples,
