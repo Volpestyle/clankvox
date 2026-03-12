@@ -57,8 +57,6 @@ struct SessionDescriptionPayload {
     audio_codec: Option<String>,
     #[serde(default)]
     media_session_id: Option<String>,
-    #[serde(default)]
-    keyframe_interval: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
