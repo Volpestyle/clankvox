@@ -151,42 +151,35 @@ impl DaveManager {
             .map_err(|e| anyhow::anyhow!("encrypt_opus: {e:?}"))
     }
 
-    pub fn decrypt(&mut self, sender_user_id: u64, frame: &[u8]) -> Result<Vec<u8>> {
+    fn decrypt_media(
+        &mut self,
+        sender_user_id: u64,
+        media_type: MediaType,
+        frame: &[u8],
+        label: &str,
+    ) -> Result<Vec<u8>> {
         if !self.ready {
             return Ok(frame.to_vec());
         }
         if self.protocol_version == 0 {
-            // DAVE disabled (downgrade executed). Frames should be plain Opus, but
+            // DAVE disabled (downgrade executed). Frames should be plain media, but
             // peers still transitioning may send DAVE-encrypted frames with keys from
             // their old MLS group. Try decrypt; if the frame is unencrypted (no magic
-            // marker), pass it through. If it's encrypted with unknown keys, drop it —
-            // passing raw DAVE frames to Opus produces garbage.
-            return match self
-                .session
-                .decrypt(sender_user_id, MediaType::AUDIO, frame)
-            {
+            // marker), pass it through. If it's encrypted with unknown keys, drop it.
+            return match self.session.decrypt(sender_user_id, media_type, frame) {
                 Ok(decrypted) => {
                     self.consecutive_failures = 0;
                     Ok(decrypted)
                 }
                 Err(DecryptError::DecryptionFailed(
                     DecryptorDecryptError::UnencryptedWhenPassthroughDisabled,
-                )) => {
-                    // Frame has no DAVE magic marker — it's plain Opus. Pass through.
-                    Ok(frame.to_vec())
-                }
-                Err(_) => {
-                    // Frame is DAVE-encrypted with keys we don't have. Drop it.
-                    Err(anyhow::anyhow!(
-                        "decrypt: encrypted with unknown keys (pv=0 transition)"
-                    ))
-                }
+                )) => Ok(frame.to_vec()),
+                Err(_) => Err(anyhow::anyhow!(
+                    "decrypt_{label}: encrypted with unknown keys (pv=0 transition)"
+                )),
             };
         }
-        match self
-            .session
-            .decrypt(sender_user_id, MediaType::AUDIO, frame)
-        {
+        match self.session.decrypt(sender_user_id, media_type, frame) {
             Ok(decrypted) => {
                 self.consecutive_failures = 0;
                 Ok(decrypted)
@@ -194,14 +187,19 @@ impl DaveManager {
             Err(DecryptError::DecryptionFailed(
                 DecryptorDecryptError::UnencryptedWhenPassthroughDisabled,
             )) => {
-                // Some live sessions can briefly deliver plaintext Opus even while
-                // protocol_version remains non-zero. Treat these frames as passthrough
-                // instead of dropping the user audio stream.
                 self.consecutive_failures = 0;
                 Ok(frame.to_vec())
             }
-            Err(e) => Err(anyhow::anyhow!("decrypt: {e:?}")),
+            Err(e) => Err(anyhow::anyhow!("decrypt_{label}: {e:?}")),
         }
+    }
+
+    pub fn decrypt(&mut self, sender_user_id: u64, frame: &[u8]) -> Result<Vec<u8>> {
+        self.decrypt_media(sender_user_id, MediaType::AUDIO, frame, "audio")
+    }
+
+    pub fn decrypt_video(&mut self, sender_user_id: u64, frame: &[u8]) -> Result<Vec<u8>> {
+        self.decrypt_media(sender_user_id, MediaType::VIDEO, frame, "video")
     }
 
     pub fn is_ready(&self) -> bool {

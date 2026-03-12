@@ -1,8 +1,10 @@
+use std::collections::BTreeMap;
 use std::collections::hash_map::Entry;
 
 use audiopus::coder::Decoder as OpusDecoder;
 use audiopus::packet::Packet as OpusPacket;
 use audiopus::{Channels, MutSignals, SampleRate};
+use base64::Engine as _;
 use tokio::time;
 
 use crate::app_state::AppState;
@@ -12,6 +14,7 @@ use crate::capture::{
 };
 use crate::ipc::{OutMsg, send_msg};
 use crate::ipc_protocol::CaptureCommand;
+use crate::video::{RemoteVideoState, UserVideoSubscription};
 use crate::voice_conn::VoiceEvent;
 
 fn update_speaking_state(
@@ -33,6 +36,71 @@ fn update_speaking_state(
 }
 
 impl AppState {
+    fn emit_user_video_state(&self, user_id: u64, state: &RemoteVideoState) {
+        send_msg(&OutMsg::UserVideoState {
+            user_id: user_id.to_string(),
+            audio_ssrc: state.audio_ssrc,
+            video_ssrc: state.video_ssrc,
+            codec: state.codec.clone(),
+            streams: state.streams.clone(),
+        });
+    }
+
+    fn emit_user_video_end(&self, user_id: u64, state: Option<&RemoteVideoState>) {
+        let ssrc = state.and_then(|state| {
+            state
+                .video_ssrc
+                .or_else(|| state.streams.first().map(|stream| stream.ssrc))
+        });
+        send_msg(&OutMsg::UserVideoEnd {
+            user_id: user_id.to_string(),
+            ssrc,
+        });
+    }
+
+    fn refresh_video_sink_wants(&self, reason: &str) {
+        let Some(conn) = self.voice_conn.as_ref() else {
+            return;
+        };
+
+        let mut wants: BTreeMap<u32, u8> = BTreeMap::new();
+        let mut pixel_counts: BTreeMap<u32, f64> = BTreeMap::new();
+
+        for (&user_id, remote_state) in &self.remote_video_states {
+            for stream in &remote_state.streams {
+                wants.entry(stream.ssrc).or_insert(0);
+            }
+            if let Some(video_ssrc) = remote_state.video_ssrc {
+                wants.entry(video_ssrc).or_insert(0);
+            }
+
+            let Some(subscription) = self.user_video_subscriptions.get(&user_id) else {
+                continue;
+            };
+
+            if let Some(stream) = remote_state.preferred_stream(subscription) {
+                wants.insert(stream.ssrc, subscription.preferred_quality);
+                if let Some(pixel_count) = subscription
+                    .preferred_pixel_count
+                    .or_else(|| stream.pixel_count_hint())
+                {
+                    pixel_counts.insert(stream.ssrc, f64::from(pixel_count));
+                }
+            } else if let Some(video_ssrc) = remote_state.video_ssrc {
+                wants.insert(video_ssrc, subscription.preferred_quality);
+                if let Some(pixel_count) = subscription.preferred_pixel_count {
+                    pixel_counts.insert(video_ssrc, f64::from(pixel_count));
+                }
+            }
+        }
+
+        let wants = wants.into_iter().collect::<Vec<_>>();
+        let pixel_counts = pixel_counts.into_iter().collect::<Vec<_>>();
+        if let Err(error) = conn.update_media_sink_wants(&wants, &pixel_counts) {
+            tracing::warn!(reason = reason, error = %error, "failed to update Discord media sink wants");
+        }
+    }
+
     pub(crate) fn handle_capture_command(&mut self, msg: CaptureCommand) {
         match msg {
             CaptureCommand::SubscribeUser {
@@ -68,6 +136,41 @@ impl AppState {
                     }
                 }
             }
+            CaptureCommand::SubscribeUserVideo {
+                user_id,
+                max_frames_per_second,
+                preferred_quality,
+                preferred_pixel_count,
+                preferred_stream_type,
+            } => {
+                let Some(user_id) =
+                    crate::app_state::parse_user_id_field(&user_id, "subscribe_user_video")
+                else {
+                    return;
+                };
+                self.user_video_subscriptions.insert(
+                    user_id,
+                    UserVideoSubscription::new(
+                        max_frames_per_second,
+                        preferred_quality,
+                        preferred_pixel_count,
+                        preferred_stream_type,
+                    ),
+                );
+                if let Some(state) = self.remote_video_states.get(&user_id) {
+                    self.emit_user_video_state(user_id, state);
+                }
+                self.refresh_video_sink_wants("subscribe_user_video");
+            }
+            CaptureCommand::UnsubscribeUserVideo { user_id } => {
+                let Some(user_id) =
+                    crate::app_state::parse_user_id_field(&user_id, "unsubscribe_user_video")
+                else {
+                    return;
+                };
+                self.user_video_subscriptions.remove(&user_id);
+                self.refresh_video_sink_wants("unsubscribe_user_video");
+            }
         }
     }
 
@@ -91,15 +194,69 @@ impl AppState {
                     }
                     Err(error) => tracing::error!("Failed to init audio send state: {}", error),
                 }
+
+                self.refresh_video_sink_wants("voice_ready");
             }
             VoiceEvent::SsrcUpdate { ssrc, user_id } => {
                 if self.ssrc_map.insert(ssrc, user_id) != Some(user_id) {
                     self.opus_decoders.remove(&ssrc);
                 }
             }
+            VoiceEvent::VideoStateUpdate {
+                user_id,
+                audio_ssrc,
+                video_ssrc,
+                codec,
+                streams,
+            } => {
+                if self.self_user_id == Some(user_id) {
+                    return;
+                }
+
+                let previous = self.remote_video_states.get(&user_id).cloned();
+                let clear_video_state = video_ssrc.is_none() && streams.is_empty();
+                let state = RemoteVideoState {
+                    audio_ssrc: if clear_video_state {
+                        None
+                    } else {
+                        audio_ssrc.or_else(|| previous.as_ref().and_then(|state| state.audio_ssrc))
+                    },
+                    video_ssrc: if clear_video_state {
+                        None
+                    } else {
+                        video_ssrc.or_else(|| previous.as_ref().and_then(|state| state.video_ssrc))
+                    },
+                    codec: if clear_video_state {
+                        None
+                    } else {
+                        codec.or_else(|| previous.as_ref().and_then(|state| state.codec.clone()))
+                    },
+                    streams: if clear_video_state {
+                        Vec::new()
+                    } else if streams.is_empty() {
+                        previous
+                            .as_ref()
+                            .map(|state| state.streams.clone())
+                            .unwrap_or_default()
+                    } else {
+                        streams
+                    },
+                };
+
+                if state.has_streams() {
+                    self.remote_video_states.insert(user_id, state.clone());
+                    self.emit_user_video_state(user_id, &state);
+                } else {
+                    let ended_state = self.remote_video_states.remove(&user_id).or(previous);
+                    self.emit_user_video_end(user_id, ended_state.as_ref());
+                }
+
+                self.refresh_video_sink_wants("video_state_update");
+            }
             VoiceEvent::ClientDisconnect { user_id } => {
                 if self.self_user_id != Some(user_id) {
                     self.remove_user_runtime_state(user_id);
+                    self.refresh_video_sink_wants("client_disconnect");
                 }
             }
             VoiceEvent::OpusReceived { ssrc, opus_frame } => {
@@ -182,6 +339,47 @@ impl AppState {
                         tracing::debug!("Opus decode error for ssrc={}: {:?}", ssrc, error);
                     }
                 }
+            }
+            VoiceEvent::VideoFrameReceived {
+                user_id,
+                ssrc,
+                codec,
+                keyframe,
+                frame,
+                rtp_timestamp,
+                stream_type,
+                rid,
+            } => {
+                if self.self_user_id == Some(user_id) {
+                    return;
+                }
+
+                let Some(subscription) = self.user_video_subscriptions.get_mut(&user_id) else {
+                    return;
+                };
+
+                let now = time::Instant::now();
+                let min_gap = std::time::Duration::from_secs_f64(
+                    1.0 / f64::from(subscription.max_frames_per_second.max(1)),
+                );
+                if let Some(last_frame_sent_at) = subscription.last_frame_sent_at {
+                    if now.duration_since(last_frame_sent_at) < min_gap {
+                        return;
+                    }
+                }
+                subscription.last_frame_sent_at = Some(now);
+
+                let frame_base64 = base64::engine::general_purpose::STANDARD.encode(frame);
+                send_msg(&OutMsg::UserVideoFrame {
+                    user_id: user_id.to_string(),
+                    ssrc,
+                    codec,
+                    keyframe,
+                    frame_base64,
+                    rtp_timestamp,
+                    stream_type,
+                    rid,
+                });
             }
             VoiceEvent::DaveReady => {
                 tracing::info!("DAVE E2EE session is ready");

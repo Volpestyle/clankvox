@@ -1,4 +1,5 @@
 use std::io::{self, BufRead, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crossbeam_channel as crossbeam;
 use serde::{Deserialize, Serialize};
@@ -6,13 +7,17 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+use crate::video::VideoStreamDescriptor;
+
 #[derive(Clone, Debug)]
 struct IpcSenders {
     control_tx: crossbeam::Sender<OutMsg>,
     audio_tx: crossbeam::Sender<OutMsg>,
+    video_tx: crossbeam::Sender<OutMsg>,
 }
 
 static IPC_TX: std::sync::OnceLock<IpcSenders> = std::sync::OnceLock::new();
+static DROPPED_OUTBOUND_VIDEO_FRAMES: AtomicU64 = AtomicU64::new(0);
 const MAX_STDIN_LINE_BYTES: usize = 1_024 * 1_024;
 
 #[derive(Deserialize, Debug)]
@@ -55,6 +60,25 @@ pub enum InMsg {
         #[serde(rename = "userId")]
         user_id: String,
     },
+    SubscribeUserVideo {
+        #[serde(rename = "userId")]
+        user_id: String,
+        #[serde(
+            rename = "maxFramesPerSecond",
+            default = "default_video_max_frames_per_second"
+        )]
+        max_frames_per_second: u32,
+        #[serde(rename = "preferredQuality", default = "default_video_quality")]
+        preferred_quality: u32,
+        #[serde(rename = "preferredPixelCount")]
+        preferred_pixel_count: Option<u32>,
+        #[serde(rename = "preferredStreamType")]
+        preferred_stream_type: Option<String>,
+    },
+    UnsubscribeUserVideo {
+        #[serde(rename = "userId")]
+        user_id: String,
+    },
     MusicPlay {
         url: String,
         #[serde(rename = "resolvedDirectUrl", default)]
@@ -77,6 +101,14 @@ pub fn default_sample_rate() -> u32 {
 
 pub fn default_silence_duration() -> u32 {
     700
+}
+
+pub fn default_video_max_frames_per_second() -> u32 {
+    2
+}
+
+pub fn default_video_quality() -> u32 {
+    100
 }
 
 #[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,6 +165,38 @@ pub enum OutMsg {
         #[serde(rename = "userId")]
         user_id: String,
     },
+    UserVideoState {
+        #[serde(rename = "userId")]
+        user_id: String,
+        #[serde(rename = "audioSsrc", skip_serializing_if = "Option::is_none")]
+        audio_ssrc: Option<u32>,
+        #[serde(rename = "videoSsrc", skip_serializing_if = "Option::is_none")]
+        video_ssrc: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        codec: Option<String>,
+        streams: Vec<VideoStreamDescriptor>,
+    },
+    UserVideoFrame {
+        #[serde(rename = "userId")]
+        user_id: String,
+        ssrc: u32,
+        codec: String,
+        keyframe: bool,
+        #[serde(rename = "frameBase64")]
+        frame_base64: String,
+        #[serde(rename = "rtpTimestamp")]
+        rtp_timestamp: u32,
+        #[serde(rename = "streamType", skip_serializing_if = "Option::is_none")]
+        stream_type: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rid: Option<String>,
+    },
+    UserVideoEnd {
+        #[serde(rename = "userId")]
+        user_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ssrc: Option<u32>,
+    },
     ClientDisconnect {
         #[serde(rename = "userId")]
         user_id: String,
@@ -168,10 +232,6 @@ pub struct VoiceStateData {
     pub session_id: Option<String>,
     pub user_id: Option<String>,
     pub channel_id: Option<String>,
-}
-
-fn is_lossy_ipc_msg(msg: &OutMsg) -> bool {
-    matches!(msg, OutMsg::UserAudio { .. })
 }
 
 fn is_lossy_inbound_msg(msg: &InMsg) -> bool {
@@ -221,18 +281,47 @@ fn encode_user_audio_payload(
 
 pub fn send_msg(msg: &OutMsg) {
     if let Some(tx) = IPC_TX.get() {
-        if is_lossy_ipc_msg(msg) {
-            // Audio frames are lossy — drop on backpressure rather than blocking.
-            if let Err(err) = tx.audio_tx.try_send(msg.clone()) {
-                if !matches!(err, crossbeam::TrySendError::Full(_)) {
-                    error!("failed to send lossy IPC message: {}", err);
+        match msg {
+            OutMsg::UserAudio { .. } => {
+                // Audio frames are lossy — drop on backpressure rather than blocking.
+                if let Err(err) = tx.audio_tx.try_send(msg.clone()) {
+                    if !matches!(err, crossbeam::TrySendError::Full(_)) {
+                        error!("failed to send lossy audio IPC message: {}", err);
+                    }
                 }
             }
-        } else {
-            // Control messages must not block real-time async tasks. Route them
-            // through an unbounded control lane handled by the writer thread.
-            if let Err(err) = tx.control_tx.send(msg.clone()) {
-                error!("failed to send control IPC message: {}", err);
+            OutMsg::UserVideoFrame { user_id, ssrc, .. } => match tx.video_tx.try_send(msg.clone())
+            {
+                Ok(()) => {
+                    let dropped = DROPPED_OUTBOUND_VIDEO_FRAMES.swap(0, Ordering::Relaxed);
+                    if dropped > 0 {
+                        info!(
+                            dropped_video_frames = dropped,
+                            "clankvox_outbound_video_backpressure_recovered"
+                        );
+                    }
+                }
+                Err(crossbeam::TrySendError::Full(_)) => {
+                    let dropped = DROPPED_OUTBOUND_VIDEO_FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+                    if dropped == 1 || dropped % 100 == 0 {
+                        warn!(
+                            user_id,
+                            ssrc,
+                            dropped_video_frames = dropped,
+                            "dropping outbound clankvox video IPC due to backpressure"
+                        );
+                    }
+                }
+                Err(crossbeam::TrySendError::Disconnected(_)) => {
+                    error!("failed to send lossy video IPC message: channel disconnected");
+                }
+            },
+            _ => {
+                // Control messages must not block real-time async tasks. Route them
+                // through an unbounded control lane handled by the writer thread.
+                if let Err(err) = tx.control_tx.send(msg.clone()) {
+                    error!("failed to send control IPC message: {}", err);
+                }
             }
         }
     }
@@ -422,27 +511,33 @@ pub fn spawn_ipc_writer() {
 
     let (control_tx, control_rx) = crossbeam::unbounded::<OutMsg>();
     let (audio_tx, audio_rx) = crossbeam::bounded::<OutMsg>(512);
+    let (video_tx, video_rx) = crossbeam::bounded::<OutMsg>(64);
     std::thread::spawn(move || {
         let mut out = io::stdout().lock();
         loop {
             let msg = match control_rx.try_recv() {
                 Ok(msg) => msg,
-                Err(crossbeam::TryRecvError::Empty) => {
-                    crossbeam::select! {
-                        recv(control_rx) -> msg => match msg {
-                            Ok(msg) => msg,
-                            Err(_) => break,
-                        },
-                        recv(audio_rx) -> msg => match msg {
-                            Ok(msg) => msg,
-                            Err(_) => break,
-                        },
-                    }
-                }
-                Err(crossbeam::TryRecvError::Disconnected) => match audio_rx.recv() {
+                Err(crossbeam::TryRecvError::Empty) => match audio_rx.try_recv() {
                     Ok(msg) => msg,
-                    Err(_) => break,
+                    Err(crossbeam::TryRecvError::Empty) => {
+                        crossbeam::select! {
+                            recv(control_rx) -> msg => match msg {
+                                Ok(msg) => msg,
+                                Err(_) => break,
+                            },
+                            recv(audio_rx) -> msg => match msg {
+                                Ok(msg) => msg,
+                                Err(_) => break,
+                            },
+                            recv(video_rx) -> msg => match msg {
+                                Ok(msg) => msg,
+                                Err(_) => break,
+                            },
+                        }
+                    }
+                    Err(crossbeam::TryRecvError::Disconnected) => break,
                 },
+                Err(crossbeam::TryRecvError::Disconnected) => break,
             };
 
             match msg {
@@ -499,6 +594,7 @@ pub fn spawn_ipc_writer() {
     let senders = IpcSenders {
         control_tx,
         audio_tx,
+        video_tx,
     };
     IPC_TX
         .set(senders.clone())

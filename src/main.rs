@@ -9,6 +9,7 @@ mod ipc_protocol;
 mod ipc_router;
 mod music;
 mod playback_supervisor;
+mod video;
 mod voice_conn;
 
 use std::io;

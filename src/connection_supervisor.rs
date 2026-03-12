@@ -179,6 +179,7 @@ impl AppState {
                             new_session_id
                         );
                         self.clear_voice_connection();
+                        self.clear_transport_runtime_state("session_id_changed");
                     }
                     self.pending_conn.session_id = Some(session_id.clone());
                 }

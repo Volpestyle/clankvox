@@ -29,6 +29,16 @@ pub(crate) enum CaptureCommand {
     UnsubscribeUser {
         user_id: String,
     },
+    SubscribeUserVideo {
+        user_id: String,
+        max_frames_per_second: u32,
+        preferred_quality: u32,
+        preferred_pixel_count: Option<u32>,
+        preferred_stream_type: Option<String>,
+    },
+    UnsubscribeUserVideo {
+        user_id: String,
+    },
 }
 
 pub(crate) enum PlaybackCommand {
@@ -84,6 +94,24 @@ impl TryFrom<InMsg> for RoutedInMsg {
             })),
             InMsg::UnsubscribeUser { user_id } => {
                 Ok(Self::Capture(CaptureCommand::UnsubscribeUser { user_id }))
+            }
+            InMsg::SubscribeUserVideo {
+                user_id,
+                max_frames_per_second,
+                preferred_quality,
+                preferred_pixel_count,
+                preferred_stream_type,
+            } => Ok(Self::Capture(CaptureCommand::SubscribeUserVideo {
+                user_id,
+                max_frames_per_second,
+                preferred_quality,
+                preferred_pixel_count,
+                preferred_stream_type,
+            })),
+            InMsg::UnsubscribeUserVideo { user_id } => {
+                Ok(Self::Capture(CaptureCommand::UnsubscribeUserVideo {
+                    user_id,
+                }))
             }
             InMsg::Audio {
                 pcm_base64,

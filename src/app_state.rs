@@ -13,6 +13,7 @@ use crate::capture::{SpeakingState, UserCaptureState};
 use crate::dave::DaveManager;
 use crate::ipc::{ErrorCode, OutMsg, send_error, send_gateway_voice_state_update, send_msg};
 use crate::music::{MusicEvent, MusicState, drain_music_pcm_queue};
+use crate::video::{RemoteVideoState, UserVideoSubscription};
 use crate::voice_conn::{VoiceConnection, VoiceEvent};
 
 pub(crate) fn schedule_reconnect(
@@ -84,6 +85,8 @@ pub(crate) struct AppState {
     pub(crate) ssrc_map: HashMap<u32, u64>,
     pub(crate) self_user_id: Option<u64>,
     pub(crate) user_capture_states: HashMap<u64, UserCaptureState>,
+    pub(crate) user_video_subscriptions: HashMap<u64, UserVideoSubscription>,
+    pub(crate) remote_video_states: HashMap<u64, RemoteVideoState>,
     pub(crate) speaking_states: HashMap<u64, SpeakingState>,
     pub(crate) buffer_depth_tick_counter: u32,
     pub(crate) buffer_depth_was_nonempty: bool,
@@ -120,6 +123,8 @@ impl AppState {
             ssrc_map: HashMap::new(),
             self_user_id: None,
             user_capture_states: HashMap::new(),
+            user_video_subscriptions: HashMap::new(),
+            remote_video_states: HashMap::new(),
             speaking_states: HashMap::new(),
             buffer_depth_tick_counter: 0,
             buffer_depth_was_nonempty: false,
@@ -173,6 +178,26 @@ impl AppState {
         *self.audio_send_state.lock() = None;
     }
 
+    pub(crate) fn clear_transport_runtime_state(&mut self, reason: &str) {
+        let cleared_audio_ssrcs = self.ssrc_map.len();
+        let cleared_decoders = self.opus_decoders.len();
+        let cleared_speaking_users = self.speaking_states.len();
+        let cleared_video_users = self.remote_video_states.len();
+        self.ssrc_map.clear();
+        self.opus_decoders.clear();
+        self.speaking_states.clear();
+        self.remote_video_states.clear();
+
+        tracing::info!(
+            reason = reason,
+            cleared_audio_ssrcs,
+            cleared_decoders,
+            cleared_speaking_users,
+            cleared_video_users,
+            "cleared voice transport runtime state"
+        );
+    }
+
     pub(crate) fn remove_user_runtime_state(&mut self, user_id: u64) {
         let removed_ssrcs = self
             .ssrc_map
@@ -201,6 +226,17 @@ impl AppState {
             }
         }
 
+        self.user_video_subscriptions.remove(&user_id);
+        if let Some(state) = self.remote_video_states.remove(&user_id) {
+            let end_ssrc = state
+                .video_ssrc
+                .or_else(|| state.streams.first().map(|stream| stream.ssrc));
+            send_msg(&OutMsg::UserVideoEnd {
+                user_id: uid_str.clone(),
+                ssrc: end_ssrc,
+            });
+        }
+
         send_msg(&OutMsg::ClientDisconnect { user_id: uid_str });
     }
 
@@ -213,9 +249,8 @@ impl AppState {
         self.music.reset();
         drain_music_pcm_queue(&self.music_pcm_rx);
         self.clear_voice_connection();
-        self.ssrc_map.clear();
-        self.opus_decoders.clear();
-        self.speaking_states.clear();
+        self.clear_transport_runtime_state(reason);
+
         self.schedule_reconnect(reason);
     }
 }
@@ -226,4 +261,83 @@ pub(crate) enum TryConnectOutcome {
     MissingData,
     Connected,
     Failed,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crossbeam_channel as crossbeam;
+    use parking_lot::Mutex;
+    use tokio::sync::mpsc;
+
+    use crate::audio_pipeline::AudioSendState;
+    use crate::capture::SpeakingState;
+    use crate::dave::DaveManager;
+    use crate::music::MusicEvent;
+    use crate::video::{RemoteVideoState, UserVideoSubscription, VideoStreamDescriptor};
+    use crate::voice_conn::VoiceEvent;
+
+    use super::AppState;
+
+    fn test_app_state() -> AppState {
+        let dave: Arc<Mutex<Option<DaveManager>>> = Arc::new(Mutex::new(None));
+        let (voice_event_tx, _voice_event_rx) = mpsc::channel::<VoiceEvent>(4);
+        let audio_send_state = Arc::new(Mutex::new(None::<AudioSendState>));
+        let (music_pcm_tx, music_pcm_rx) = crossbeam::bounded::<Vec<i16>>(4);
+        let (music_event_tx, _music_event_rx) = mpsc::channel::<MusicEvent>(4);
+
+        AppState::new(
+            dave,
+            voice_event_tx,
+            audio_send_state,
+            music_pcm_tx,
+            music_pcm_rx,
+            music_event_tx,
+        )
+    }
+
+    #[test]
+    fn clear_transport_runtime_state_drops_transport_state_but_keeps_subscriptions() {
+        let mut state = test_app_state();
+        state.ssrc_map.insert(111, 42);
+        state.speaking_states.insert(
+            42,
+            SpeakingState {
+                last_packet_at: None,
+                is_speaking: true,
+            },
+        );
+        state.user_video_subscriptions.insert(
+            42,
+            UserVideoSubscription::new(15, 80, Some(1_280 * 720), Some("screen".into())),
+        );
+        state.remote_video_states.insert(
+            42,
+            RemoteVideoState {
+                audio_ssrc: Some(211),
+                video_ssrc: Some(311),
+                codec: Some("h264".into()),
+                streams: vec![VideoStreamDescriptor {
+                    ssrc: 311,
+                    rtx_ssrc: Some(411),
+                    rid: Some("f".into()),
+                    quality: Some(100),
+                    stream_type: Some("screen".into()),
+                    active: Some(true),
+                    max_bitrate: Some(4_000_000),
+                    max_framerate: Some(30),
+                    max_resolution: None,
+                }],
+            },
+        );
+
+        state.clear_transport_runtime_state("test");
+
+        assert!(state.ssrc_map.is_empty());
+        assert!(state.opus_decoders.is_empty());
+        assert!(state.speaking_states.is_empty());
+        assert!(state.remote_video_states.is_empty());
+        assert!(state.user_video_subscriptions.contains_key(&42));
+    }
 }
