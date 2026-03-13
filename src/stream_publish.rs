@@ -1202,6 +1202,10 @@ impl AppState {
         let Ok(frame) = self.stream_publish_frame_rx.try_recv() else {
             return;
         };
+        // Intentionally drain even while inactive/paused so a shared music
+        // visualizer pipeline cannot backpressure audio playback by filling this
+        // bounded queue. In those states we prefer dropping stale visualizer
+        // frames over preserving them for later send.
         if !self.stream_publish.active || self.stream_publish.paused {
             return;
         }

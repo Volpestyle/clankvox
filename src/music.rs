@@ -245,6 +245,11 @@ impl MusicPlayer {
                 },
                 MusicPlayerSource::AudioOnly { .. } => None,
             };
+            // Keep `audio_pipe` alive until after `spawn()` succeeds or fails.
+            // The raw fd captured below is only valid while the backing `OwnedFd`
+            // remains owned here; we intentionally `take()` the pipe only after
+            // `spawn()` has completed and `dup2(..., 3)` has already run in
+            // `pre_exec`.
             let audio_pipe_writer_raw = audio_pipe.as_ref().map(|(_, writer)| writer.as_raw_fd());
             let pipeline_command = match &source_for_thread {
                 MusicPlayerSource::AudioOnly {
