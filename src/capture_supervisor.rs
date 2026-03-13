@@ -15,7 +15,7 @@ use crate::capture::{
 use crate::ipc::{OutMsg, send_msg};
 use crate::ipc_protocol::CaptureCommand;
 use crate::video::{RemoteVideoState, UserVideoSubscription};
-use crate::voice_conn::VoiceEvent;
+use crate::voice_conn::{TransportRole, VoiceEvent};
 
 fn update_speaking_state(
     speaking_states: &mut std::collections::HashMap<u64, SpeakingState>,
@@ -37,6 +37,26 @@ fn update_speaking_state(
 
 impl AppState {
     fn emit_user_video_state(&self, user_id: u64, state: &RemoteVideoState) {
+        let stream_ssrcs = state
+            .streams
+            .iter()
+            .map(|stream| stream.ssrc)
+            .collect::<Vec<_>>();
+        let active_stream_count = state
+            .streams
+            .iter()
+            .filter(|stream| stream.is_active())
+            .count();
+        tracing::info!(
+            user_id,
+            audio_ssrc = state.audio_ssrc,
+            video_ssrc = state.video_ssrc,
+            codec = ?state.codec.as_deref(),
+            stream_count = state.streams.len(),
+            active_stream_count,
+            stream_ssrcs = ?stream_ssrcs,
+            "clankvox_native_video_state_emitted"
+        );
         send_msg(&OutMsg::UserVideoState {
             user_id: user_id.to_string(),
             audio_ssrc: state.audio_ssrc,
@@ -52,14 +72,31 @@ impl AppState {
                 .video_ssrc
                 .or_else(|| state.streams.first().map(|stream| stream.ssrc))
         });
+        tracing::info!(
+            user_id,
+            ssrc = ssrc,
+            had_cached_state = state.is_some(),
+            "clankvox_native_video_end_emitted"
+        );
         send_msg(&OutMsg::UserVideoEnd {
             user_id: user_id.to_string(),
             ssrc,
         });
     }
 
+    fn remove_user_video_runtime_state(&mut self, user_id: u64) {
+        let ended_state = self.remote_video_states.remove(&user_id);
+        self.emit_user_video_end(user_id, ended_state.as_ref());
+    }
+
     fn refresh_video_sink_wants(&self, reason: &str) {
-        let Some(conn) = self.voice_conn.as_ref() else {
+        let Some(conn) = self.video_conn() else {
+            tracing::info!(
+                reason = reason,
+                subscribed_user_count = self.user_video_subscriptions.len(),
+                remote_video_user_count = self.remote_video_states.len(),
+                "clankvox_video_sink_wants_skipped_no_connection"
+            );
             return;
         };
 
@@ -96,6 +133,15 @@ impl AppState {
 
         let wants = wants.into_iter().collect::<Vec<_>>();
         let pixel_counts = pixel_counts.into_iter().collect::<Vec<_>>();
+        tracing::info!(
+            reason = reason,
+            subscribed_user_count = self.user_video_subscriptions.len(),
+            remote_video_user_count = self.remote_video_states.len(),
+            wanted_ssrc_count = wants.len(),
+            wanted_streams = ?wants,
+            pixel_count_overrides = ?pixel_counts,
+            "clankvox_video_sink_wants_updated"
+        );
         if let Err(error) = conn.update_media_sink_wants(&wants, &pixel_counts) {
             tracing::warn!(reason = reason, error = %error, "failed to update Discord media sink wants");
         }
@@ -148,15 +194,23 @@ impl AppState {
                 else {
                     return;
                 };
-                self.user_video_subscriptions.insert(
-                    user_id,
-                    UserVideoSubscription::new(
-                        max_frames_per_second,
-                        preferred_quality,
-                        preferred_pixel_count,
-                        preferred_stream_type,
-                    ),
+                let subscription = UserVideoSubscription::new(
+                    max_frames_per_second,
+                    preferred_quality,
+                    preferred_pixel_count,
+                    preferred_stream_type,
                 );
+                let had_cached_remote_state = self.remote_video_states.contains_key(&user_id);
+                tracing::info!(
+                    user_id,
+                    max_frames_per_second = subscription.max_frames_per_second,
+                    preferred_quality = subscription.preferred_quality,
+                    preferred_pixel_count = subscription.preferred_pixel_count,
+                    preferred_stream_type = ?subscription.preferred_stream_type.as_deref(),
+                    had_cached_remote_state,
+                    "clankvox_native_video_subscribe_requested"
+                );
+                self.user_video_subscriptions.insert(user_id, subscription);
                 if let Some(state) = self.remote_video_states.get(&user_id) {
                     self.emit_user_video_state(user_id, state);
                 }
@@ -168,7 +222,12 @@ impl AppState {
                 else {
                     return;
                 };
-                self.user_video_subscriptions.remove(&user_id);
+                let had_subscription = self.user_video_subscriptions.remove(&user_id).is_some();
+                tracing::info!(
+                    user_id,
+                    had_subscription,
+                    "clankvox_native_video_unsubscribe_requested"
+                );
                 self.refresh_video_sink_wants("unsubscribe_user_video");
             }
         }
@@ -176,45 +235,92 @@ impl AppState {
 
     pub(crate) fn handle_voice_event(&mut self, event: VoiceEvent) {
         match event {
-            VoiceEvent::Ready { ssrc } => {
-                tracing::info!("Voice connection ready, ssrc={}", ssrc);
-                self.reset_reconnect();
-                send_msg(&OutMsg::ConnectionState {
-                    status: "ready".into(),
-                });
-                send_msg(&OutMsg::Ready);
+            VoiceEvent::Ready { role, ssrc } => {
+                tracing::info!(role = role.as_str(), ssrc, "Transport ready");
+                match role {
+                    TransportRole::Voice => {
+                        self.reset_reconnect();
+                        send_msg(&OutMsg::ConnectionState {
+                            status: "ready".into(),
+                        });
+                        self.emit_transport_state(TransportRole::Voice, "ready", None);
+                        send_msg(&OutMsg::Ready);
 
-                match crate::audio_pipeline::AudioSendState::new() {
-                    Ok(state) => {
-                        *self.audio_send_state.lock() = Some(state);
-                        crate::audio_pipeline::emit_playback_armed(
-                            "connection_ready",
-                            &self.audio_send_state,
-                        );
+                        match crate::audio_pipeline::AudioSendState::new() {
+                            Ok(state) => {
+                                *self.audio_send_state.lock() = Some(state);
+                                crate::audio_pipeline::emit_playback_armed(
+                                    "connection_ready",
+                                    &self.audio_send_state,
+                                );
+                            }
+                            Err(error) => {
+                                tracing::error!("Failed to init audio send state: {}", error)
+                            }
+                        }
                     }
-                    Err(error) => tracing::error!("Failed to init audio send state: {}", error),
+                    TransportRole::StreamWatch => {
+                        self.emit_transport_state(TransportRole::StreamWatch, "ready", None);
+                    }
+                    TransportRole::StreamPublish => {
+                        self.emit_transport_state(TransportRole::StreamPublish, "ready", None);
+                        self.maybe_start_stream_publish_pipeline();
+                    }
                 }
-
-                self.refresh_video_sink_wants("voice_ready");
+                self.refresh_video_sink_wants(match role {
+                    TransportRole::Voice => "voice_ready",
+                    TransportRole::StreamWatch => "stream_watch_ready",
+                    TransportRole::StreamPublish => "stream_publish_ready",
+                });
             }
-            VoiceEvent::SsrcUpdate { ssrc, user_id } => {
-                if self.ssrc_map.insert(ssrc, user_id) != Some(user_id) {
+            VoiceEvent::SsrcUpdate {
+                role,
+                ssrc,
+                user_id,
+            } => {
+                if role == TransportRole::Voice
+                    && self.ssrc_map.insert(ssrc, user_id) != Some(user_id)
+                {
                     self.opus_decoders.remove(&ssrc);
                 }
             }
             VoiceEvent::VideoStateUpdate {
+                role,
                 user_id,
                 audio_ssrc,
                 video_ssrc,
                 codec,
                 streams,
             } => {
+                if role == TransportRole::Voice && self.stream_watch_conn.is_some() {
+                    return;
+                }
                 if self.self_user_id == Some(user_id) {
                     return;
                 }
 
                 let previous = self.remote_video_states.get(&user_id).cloned();
                 let clear_video_state = video_ssrc.is_none() && streams.is_empty();
+                let incoming_stream_ssrcs =
+                    streams.iter().map(|stream| stream.ssrc).collect::<Vec<_>>();
+                let incoming_active_stream_count =
+                    streams.iter().filter(|stream| stream.is_active()).count();
+                let previous_stream_count = previous
+                    .as_ref()
+                    .map(|state| state.streams.len())
+                    .unwrap_or_default();
+                tracing::info!(
+                    user_id,
+                    clear_video_state,
+                    audio_ssrc = audio_ssrc,
+                    video_ssrc = video_ssrc,
+                    codec = ?codec.as_deref(),
+                    incoming_stream_count = streams.len(),
+                    incoming_active_stream_count,
+                    incoming_stream_ssrcs = ?incoming_stream_ssrcs,
+                    previous_stream_count,
+                    "clankvox_native_video_state_received"
+                );
                 let state = RemoteVideoState {
                     audio_ssrc: if clear_video_state {
                         None
@@ -251,15 +357,34 @@ impl AppState {
                     self.emit_user_video_end(user_id, ended_state.as_ref());
                 }
 
-                self.refresh_video_sink_wants("video_state_update");
+                self.refresh_video_sink_wants(match role {
+                    TransportRole::Voice => "video_state_update",
+                    TransportRole::StreamWatch => "stream_watch_video_state_update",
+                    TransportRole::StreamPublish => "stream_publish_video_state_update",
+                });
             }
-            VoiceEvent::ClientDisconnect { user_id } => {
+            VoiceEvent::ClientDisconnect { role, user_id } => {
                 if self.self_user_id != Some(user_id) {
-                    self.remove_user_runtime_state(user_id);
-                    self.refresh_video_sink_wants("client_disconnect");
+                    match role {
+                        TransportRole::Voice => self.remove_user_runtime_state(user_id),
+                        TransportRole::StreamWatch => self.remove_user_video_runtime_state(user_id),
+                        TransportRole::StreamPublish => {}
+                    }
+                    self.refresh_video_sink_wants(match role {
+                        TransportRole::Voice => "client_disconnect",
+                        TransportRole::StreamWatch => "stream_watch_client_disconnect",
+                        TransportRole::StreamPublish => "stream_publish_client_disconnect",
+                    });
                 }
             }
-            VoiceEvent::OpusReceived { ssrc, opus_frame } => {
+            VoiceEvent::OpusReceived {
+                role,
+                ssrc,
+                opus_frame,
+            } => {
+                if role != TransportRole::Voice {
+                    return;
+                }
                 let Some(&user_id) = self.ssrc_map.get(&ssrc) else {
                     tracing::debug!("Dropped Opus frame from unknown ssrc: {ssrc}");
                     return;
@@ -341,6 +466,7 @@ impl AppState {
                 }
             }
             VoiceEvent::VideoFrameReceived {
+                role,
                 user_id,
                 ssrc,
                 codec,
@@ -350,6 +476,9 @@ impl AppState {
                 stream_type,
                 rid,
             } => {
+                if role == TransportRole::Voice && self.stream_watch_conn.is_some() {
+                    return;
+                }
                 if self.self_user_id == Some(user_id) {
                     return;
                 }
@@ -369,6 +498,24 @@ impl AppState {
                 }
                 subscription.last_frame_sent_at = Some(now);
 
+                let frame_bytes = frame.len();
+                subscription.forwarded_frame_count =
+                    subscription.forwarded_frame_count.saturating_add(1);
+                if subscription.forwarded_frame_count == 1 {
+                    tracing::info!(
+                        user_id,
+                        ssrc,
+                        codec = %codec,
+                        keyframe,
+                        frame_bytes,
+                        rtp_timestamp,
+                        stream_type = ?stream_type.as_deref(),
+                        rid = ?rid.as_deref(),
+                        max_frames_per_second = subscription.max_frames_per_second,
+                        "clankvox_first_video_frame_forwarded"
+                    );
+                }
+
                 let frame_base64 = base64::engine::general_purpose::STANDARD.encode(frame);
                 send_msg(&OutMsg::UserVideoFrame {
                     user_id: user_id.to_string(),
@@ -381,12 +528,32 @@ impl AppState {
                     rid,
                 });
             }
-            VoiceEvent::DaveReady => {
-                tracing::info!("DAVE E2EE session is ready");
+            VoiceEvent::DaveReady { role } => {
+                tracing::info!(role = role.as_str(), "DAVE E2EE session is ready");
             }
-            VoiceEvent::Disconnected { reason } => {
-                self.handle_disconnected(&reason);
-            }
+            VoiceEvent::Disconnected { role, reason } => match role {
+                TransportRole::Voice => self.handle_disconnected(&reason),
+                TransportRole::StreamWatch => {
+                    tracing::warn!(reason = %reason, "Stream watch transport disconnected");
+                    self.clear_stream_watch_connection();
+                    self.emit_transport_state(
+                        TransportRole::StreamWatch,
+                        "disconnected",
+                        Some(&reason),
+                    );
+                    self.refresh_video_sink_wants("stream_watch_disconnected");
+                }
+                TransportRole::StreamPublish => {
+                    tracing::warn!(reason = %reason, "Stream publish transport disconnected");
+                    self.stop_stream_publish_runtime("stream_publish_transport_disconnected");
+                    self.clear_stream_publish_connection();
+                    self.emit_transport_state(
+                        TransportRole::StreamPublish,
+                        "disconnected",
+                        Some(&reason),
+                    );
+                }
+            },
         }
     }
 

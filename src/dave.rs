@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use davey::errors::{DecryptError, DecryptorDecryptError};
-use davey::{DaveSession, MediaType, ProposalsOperationType};
+use davey::{Codec, DaveSession, MediaType, ProposalsOperationType};
 use tracing::{debug, info, warn};
 
 /// Maximum consecutive DAVE decrypt failures before triggering session recovery.
@@ -149,6 +149,16 @@ impl DaveManager {
             .encrypt_opus(frame)
             .map(std::borrow::Cow::into_owned)
             .map_err(|e| anyhow::anyhow!("encrypt_opus: {e:?}"))
+    }
+
+    pub fn encrypt_video(&mut self, frame: &[u8]) -> Result<Vec<u8>> {
+        if !self.ready || self.protocol_version == 0 {
+            return Ok(frame.to_vec());
+        }
+        self.session
+            .encrypt(MediaType::VIDEO, Codec::H264, frame)
+            .map(std::borrow::Cow::into_owned)
+            .map_err(|e| anyhow::anyhow!("encrypt_video: {e:?}"))
     }
 
     fn decrypt_media(

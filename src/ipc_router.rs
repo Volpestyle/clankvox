@@ -14,6 +14,10 @@ impl AppState {
                 false
             }
             RoutedInMsg::Playback(command) => self.handle_playback_command(command),
+            RoutedInMsg::StreamPublish(command) => {
+                self.handle_stream_publish_command(command);
+                false
+            }
         }
     }
 }

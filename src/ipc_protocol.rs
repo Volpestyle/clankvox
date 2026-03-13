@@ -4,6 +4,7 @@ pub(crate) enum RoutedInMsg {
     Connection(ConnectionCommand),
     Capture(CaptureCommand),
     Playback(PlaybackCommand),
+    StreamPublish(StreamPublishCommand),
 }
 
 pub(crate) enum ConnectionCommand {
@@ -17,6 +18,28 @@ pub(crate) enum ConnectionCommand {
     },
     VoiceState {
         data: crate::ipc::VoiceStateData,
+    },
+    StreamWatchConnect {
+        endpoint: String,
+        token: String,
+        server_id: String,
+        session_id: String,
+        user_id: String,
+        dave_channel_id: String,
+    },
+    StreamWatchDisconnect {
+        reason: Option<String>,
+    },
+    StreamPublishConnect {
+        endpoint: String,
+        token: String,
+        server_id: String,
+        session_id: String,
+        user_id: String,
+        dave_channel_id: String,
+    },
+    StreamPublishDisconnect {
+        reason: Option<String>,
     },
 }
 
@@ -62,6 +85,24 @@ pub(crate) enum PlaybackCommand {
     Destroy,
 }
 
+pub(crate) enum StreamPublishCommand {
+    Play {
+        url: String,
+        resolved_direct_url: bool,
+    },
+    BrowserStart {
+        mime_type: String,
+    },
+    BrowserFrame {
+        mime_type: String,
+        frame_base64: String,
+        captured_at_ms: u64,
+    },
+    Stop,
+    Pause,
+    Resume,
+}
+
 impl TryFrom<InMsg> for RoutedInMsg {
     type Error = InMsg;
 
@@ -83,6 +124,44 @@ impl TryFrom<InMsg> for RoutedInMsg {
             InMsg::VoiceState { data } => {
                 Ok(Self::Connection(ConnectionCommand::VoiceState { data }))
             }
+            InMsg::StreamWatchConnect {
+                endpoint,
+                token,
+                server_id,
+                session_id,
+                user_id,
+                dave_channel_id,
+            } => Ok(Self::Connection(ConnectionCommand::StreamWatchConnect {
+                endpoint,
+                token,
+                server_id,
+                session_id,
+                user_id,
+                dave_channel_id,
+            })),
+            InMsg::StreamWatchDisconnect { reason } => {
+                Ok(Self::Connection(ConnectionCommand::StreamWatchDisconnect {
+                    reason,
+                }))
+            }
+            InMsg::StreamPublishConnect {
+                endpoint,
+                token,
+                server_id,
+                session_id,
+                user_id,
+                dave_channel_id,
+            } => Ok(Self::Connection(ConnectionCommand::StreamPublishConnect {
+                endpoint,
+                token,
+                server_id,
+                session_id,
+                user_id,
+                dave_channel_id,
+            })),
+            InMsg::StreamPublishDisconnect { reason } => Ok(Self::Connection(
+                ConnectionCommand::StreamPublishDisconnect { reason },
+            )),
             InMsg::SubscribeUser {
                 user_id,
                 silence_duration_ms,
@@ -138,6 +217,30 @@ impl TryFrom<InMsg> for RoutedInMsg {
                     fade_ms,
                 }))
             }
+            InMsg::StreamPublishPlay {
+                url,
+                resolved_direct_url,
+            } => Ok(Self::StreamPublish(StreamPublishCommand::Play {
+                url,
+                resolved_direct_url,
+            })),
+            InMsg::StreamPublishBrowserStart { mime_type } => {
+                Ok(Self::StreamPublish(StreamPublishCommand::BrowserStart {
+                    mime_type,
+                }))
+            }
+            InMsg::StreamPublishBrowserFrame {
+                mime_type,
+                frame_base64,
+                captured_at_ms,
+            } => Ok(Self::StreamPublish(StreamPublishCommand::BrowserFrame {
+                mime_type,
+                frame_base64,
+                captured_at_ms,
+            })),
+            InMsg::StreamPublishStop => Ok(Self::StreamPublish(StreamPublishCommand::Stop)),
+            InMsg::StreamPublishPause => Ok(Self::StreamPublish(StreamPublishCommand::Pause)),
+            InMsg::StreamPublishResume => Ok(Self::StreamPublish(StreamPublishCommand::Resume)),
             InMsg::Destroy => Ok(Self::Playback(PlaybackCommand::Destroy)),
         }
     }

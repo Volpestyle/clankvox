@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::video::VideoStreamDescriptor;
+use crate::voice_conn::TransportRole;
 
 #[derive(Clone, Debug)]
 struct IpcSenders {
@@ -18,7 +19,7 @@ struct IpcSenders {
 
 static IPC_TX: std::sync::OnceLock<IpcSenders> = std::sync::OnceLock::new();
 static DROPPED_OUTBOUND_VIDEO_FRAMES: AtomicU64 = AtomicU64::new(0);
-const MAX_STDIN_LINE_BYTES: usize = 1_024 * 1_024;
+const MAX_STDIN_LINE_BYTES: usize = 8 * 1_024 * 1_024;
 
 #[derive(Deserialize, Debug)]
 #[serde(tag = "type")]
@@ -39,6 +40,38 @@ pub enum InMsg {
     },
     VoiceState {
         data: VoiceStateData,
+    },
+    StreamWatchConnect {
+        endpoint: String,
+        token: String,
+        #[serde(rename = "serverId")]
+        server_id: String,
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        #[serde(rename = "userId")]
+        user_id: String,
+        #[serde(rename = "daveChannelId")]
+        dave_channel_id: String,
+    },
+    StreamWatchDisconnect {
+        #[serde(default)]
+        reason: Option<String>,
+    },
+    StreamPublishConnect {
+        endpoint: String,
+        token: String,
+        #[serde(rename = "serverId")]
+        server_id: String,
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        #[serde(rename = "userId")]
+        user_id: String,
+        #[serde(rename = "daveChannelId")]
+        dave_channel_id: String,
+    },
+    StreamPublishDisconnect {
+        #[serde(default)]
+        reason: Option<String>,
     },
     Audio {
         #[serde(rename = "pcmBase64")]
@@ -92,6 +125,26 @@ pub enum InMsg {
         #[serde(rename = "fadeMs", default)]
         fade_ms: u32,
     },
+    StreamPublishPlay {
+        url: String,
+        #[serde(rename = "resolvedDirectUrl", default)]
+        resolved_direct_url: bool,
+    },
+    StreamPublishBrowserStart {
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+    },
+    StreamPublishBrowserFrame {
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+        #[serde(rename = "frameBase64")]
+        frame_base64: String,
+        #[serde(rename = "capturedAtMs", default)]
+        captured_at_ms: u64,
+    },
+    StreamPublishStop,
+    StreamPublishPause,
+    StreamPublishResume,
     Destroy,
 }
 
@@ -118,6 +171,8 @@ pub enum ErrorCode {
     InvalidJson,
     InputTooLarge,
     VoiceConnectFailed,
+    StreamWatchConnectFailed,
+    StreamPublishConnectFailed,
     VoiceRuntimeError,
 }
 
@@ -131,6 +186,12 @@ pub enum OutMsg {
     },
     ConnectionState {
         status: String,
+    },
+    TransportState {
+        role: TransportRole,
+        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     PlayerState {
         status: String,

@@ -53,6 +53,7 @@ pub(crate) struct UserVideoSubscription {
     pub(crate) preferred_pixel_count: Option<u32>,
     pub(crate) preferred_stream_type: Option<String>,
     pub(crate) last_frame_sent_at: Option<time::Instant>,
+    pub(crate) forwarded_frame_count: u64,
 }
 
 impl UserVideoSubscription {
@@ -70,6 +71,7 @@ impl UserVideoSubscription {
                 .map(|stream_type| stream_type.trim().to_ascii_lowercase())
                 .filter(|stream_type| !stream_type.is_empty()),
             last_frame_sent_at: None,
+            forwarded_frame_count: 0,
         }
     }
 }

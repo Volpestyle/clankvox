@@ -9,6 +9,7 @@ mod ipc_protocol;
 mod ipc_router;
 mod music;
 mod playback_supervisor;
+mod stream_publish;
 mod video;
 mod voice_conn;
 
@@ -25,9 +26,11 @@ use crate::audio_pipeline::AudioSendState;
 use crate::dave::DaveManager;
 use crate::ipc::{spawn_ipc_reader, spawn_ipc_writer};
 use crate::music::MusicEvent;
+use crate::stream_publish::{StreamPublishEvent, StreamPublishFrame};
 use crate::voice_conn::VoiceEvent;
 
 const MUSIC_PCM_QUEUE_CAPACITY_CHUNKS: usize = 100; // ~2s of 20ms PCM chunks
+const STREAM_PUBLISH_QUEUE_CAPACITY_FRAMES: usize = 90; // ~3s at 30fps
 
 async fn reconnect_sleep(deadline: Option<time::Instant>) {
     match deadline {
@@ -71,6 +74,10 @@ async fn main() {
     let (music_pcm_tx, music_pcm_rx) =
         crossbeam::bounded::<Vec<i16>>(MUSIC_PCM_QUEUE_CAPACITY_CHUNKS);
     let (music_event_tx, mut music_event_rx) = tokio::sync::mpsc::channel::<MusicEvent>(32);
+    let (stream_publish_frame_tx, stream_publish_frame_rx) =
+        crossbeam::bounded::<StreamPublishFrame>(STREAM_PUBLISH_QUEUE_CAPACITY_FRAMES);
+    let (stream_publish_event_tx, stream_publish_event_rx) =
+        crossbeam::bounded::<StreamPublishEvent>(32);
 
     let mut state = AppState::new(
         dave,
@@ -79,6 +86,10 @@ async fn main() {
         music_pcm_tx,
         music_pcm_rx,
         music_event_tx,
+        stream_publish_frame_tx,
+        stream_publish_frame_rx,
+        stream_publish_event_tx,
+        stream_publish_event_rx,
     );
 
     loop {

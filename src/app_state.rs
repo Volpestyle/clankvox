@@ -13,8 +13,9 @@ use crate::capture::{SpeakingState, UserCaptureState};
 use crate::dave::DaveManager;
 use crate::ipc::{ErrorCode, OutMsg, send_error, send_gateway_voice_state_update, send_msg};
 use crate::music::{MusicEvent, MusicState, drain_music_pcm_queue};
+use crate::stream_publish::{StreamPublishEvent, StreamPublishFrame, StreamPublishState};
 use crate::video::{RemoteVideoState, UserVideoSubscription};
-use crate::voice_conn::{VoiceConnection, VoiceEvent};
+use crate::voice_conn::{TransportRole, VoiceConnection, VoiceEvent};
 
 pub(crate) fn schedule_reconnect(
     reconnect_deadline: &mut Option<time::Instant>,
@@ -37,6 +38,11 @@ pub(crate) fn schedule_reconnect(
     send_msg(&OutMsg::ConnectionState {
         status: "reconnecting".into(),
     });
+    send_msg(&OutMsg::TransportState {
+        role: TransportRole::Voice,
+        status: "reconnecting".into(),
+        reason: Some(reason.to_string()),
+    });
     send_gateway_voice_state_update(guild_id, channel_id, self_mute);
     warn!(
         attempt = *reconnect_attempt,
@@ -52,6 +58,26 @@ pub(crate) struct PendingConnection {
     pub(crate) token: Option<String>,
     pub(crate) session_id: Option<String>,
     pub(crate) user_id: Option<u64>,
+}
+
+#[derive(Default, Clone)]
+pub(crate) struct PendingStreamWatchConnection {
+    pub(crate) endpoint: Option<String>,
+    pub(crate) token: Option<String>,
+    pub(crate) session_id: Option<String>,
+    pub(crate) user_id: Option<u64>,
+    pub(crate) server_id: Option<u64>,
+    pub(crate) dave_channel_id: Option<u64>,
+}
+
+#[derive(Default, Clone)]
+pub(crate) struct PendingStreamPublishConnection {
+    pub(crate) endpoint: Option<String>,
+    pub(crate) token: Option<String>,
+    pub(crate) session_id: Option<String>,
+    pub(crate) user_id: Option<u64>,
+    pub(crate) server_id: Option<u64>,
+    pub(crate) dave_channel_id: Option<u64>,
 }
 
 pub(crate) fn parse_user_id_field(user_id: &str, context: &str) -> Option<u64> {
@@ -75,12 +101,23 @@ pub(crate) struct AppState {
     pub(crate) reconnect_attempt: u32,
     pub(crate) dave: Arc<Mutex<Option<DaveManager>>>,
     pub(crate) voice_conn: Option<VoiceConnection>,
+    pub(crate) stream_watch_pending_conn: PendingStreamWatchConnection,
+    pub(crate) stream_watch_dave: Arc<Mutex<Option<DaveManager>>>,
+    pub(crate) stream_watch_conn: Option<VoiceConnection>,
+    pub(crate) stream_publish_pending_conn: PendingStreamPublishConnection,
+    pub(crate) stream_publish_dave: Arc<Mutex<Option<DaveManager>>>,
+    pub(crate) stream_publish_conn: Option<VoiceConnection>,
     pub(crate) voice_event_tx: mpsc::Sender<VoiceEvent>,
     pub(crate) audio_send_state: Arc<Mutex<Option<AudioSendState>>>,
     pub(crate) music_pcm_tx: crossbeam::Sender<Vec<i16>>,
     pub(crate) music_pcm_rx: crossbeam::Receiver<Vec<i16>>,
     pub(crate) music_event_tx: mpsc::Sender<MusicEvent>,
+    pub(crate) stream_publish_frame_tx: crossbeam::Sender<StreamPublishFrame>,
+    pub(crate) stream_publish_frame_rx: crossbeam::Receiver<StreamPublishFrame>,
+    pub(crate) stream_publish_event_tx: crossbeam::Sender<StreamPublishEvent>,
+    pub(crate) stream_publish_event_rx: crossbeam::Receiver<StreamPublishEvent>,
     pub(crate) music: MusicState,
+    pub(crate) stream_publish: StreamPublishState,
     pub(crate) opus_decoders: HashMap<u32, OpusDecoder>,
     pub(crate) ssrc_map: HashMap<u32, u64>,
     pub(crate) self_user_id: Option<u64>,
@@ -103,6 +140,10 @@ impl AppState {
         music_pcm_tx: crossbeam::Sender<Vec<i16>>,
         music_pcm_rx: crossbeam::Receiver<Vec<i16>>,
         music_event_tx: mpsc::Sender<MusicEvent>,
+        stream_publish_frame_tx: crossbeam::Sender<StreamPublishFrame>,
+        stream_publish_frame_rx: crossbeam::Receiver<StreamPublishFrame>,
+        stream_publish_event_tx: crossbeam::Sender<StreamPublishEvent>,
+        stream_publish_event_rx: crossbeam::Receiver<StreamPublishEvent>,
     ) -> Self {
         Self {
             pending_conn: PendingConnection::default(),
@@ -113,12 +154,23 @@ impl AppState {
             reconnect_attempt: 0,
             dave,
             voice_conn: None,
+            stream_watch_pending_conn: PendingStreamWatchConnection::default(),
+            stream_watch_dave: Arc::new(Mutex::new(None)),
+            stream_watch_conn: None,
+            stream_publish_pending_conn: PendingStreamPublishConnection::default(),
+            stream_publish_dave: Arc::new(Mutex::new(None)),
+            stream_publish_conn: None,
             voice_event_tx,
             audio_send_state,
             music_pcm_tx,
             music_pcm_rx,
             music_event_tx,
+            stream_publish_frame_tx,
+            stream_publish_frame_rx,
+            stream_publish_event_tx,
+            stream_publish_event_rx,
             music: MusicState::default(),
+            stream_publish: StreamPublishState::default(),
             opus_decoders: HashMap::new(),
             ssrc_map: HashMap::new(),
             self_user_id: None,
@@ -175,7 +227,41 @@ impl AppState {
             conn.shutdown();
         }
         self.voice_conn = None;
+        *self.dave.lock() = None;
         *self.audio_send_state.lock() = None;
+    }
+
+    pub(crate) fn clear_stream_watch_connection(&mut self) {
+        if let Some(ref conn) = self.stream_watch_conn {
+            conn.shutdown();
+        }
+        self.stream_watch_conn = None;
+        *self.stream_watch_dave.lock() = None;
+    }
+
+    pub(crate) fn clear_stream_publish_connection(&mut self) {
+        if let Some(ref conn) = self.stream_publish_conn {
+            conn.shutdown();
+        }
+        self.stream_publish_conn = None;
+        *self.stream_publish_dave.lock() = None;
+    }
+
+    pub(crate) fn video_conn(&self) -> Option<&VoiceConnection> {
+        self.stream_watch_conn.as_ref().or(self.voice_conn.as_ref())
+    }
+
+    pub(crate) fn emit_transport_state(
+        &self,
+        role: TransportRole,
+        status: &str,
+        reason: Option<&str>,
+    ) {
+        send_msg(&OutMsg::TransportState {
+            role,
+            status: status.to_string(),
+            reason: reason.map(ToString::to_string),
+        });
     }
 
     pub(crate) fn clear_transport_runtime_state(&mut self, reason: &str) {
@@ -246,9 +332,12 @@ impl AppState {
         send_msg(&OutMsg::ConnectionState {
             status: "disconnected".into(),
         });
+        self.emit_transport_state(TransportRole::Voice, "disconnected", Some(reason));
         self.music.reset();
+        self.stream_publish.reset();
         drain_music_pcm_queue(&self.music_pcm_rx);
         self.clear_voice_connection();
+        self.clear_stream_publish_connection();
         self.clear_transport_runtime_state(reason);
 
         self.schedule_reconnect(reason);
@@ -275,6 +364,7 @@ mod tests {
     use crate::capture::SpeakingState;
     use crate::dave::DaveManager;
     use crate::music::MusicEvent;
+    use crate::stream_publish::{StreamPublishEvent, StreamPublishFrame};
     use crate::video::{RemoteVideoState, UserVideoSubscription, VideoStreamDescriptor};
     use crate::voice_conn::VoiceEvent;
 
@@ -286,6 +376,10 @@ mod tests {
         let audio_send_state = Arc::new(Mutex::new(None::<AudioSendState>));
         let (music_pcm_tx, music_pcm_rx) = crossbeam::bounded::<Vec<i16>>(4);
         let (music_event_tx, _music_event_rx) = mpsc::channel::<MusicEvent>(4);
+        let (stream_publish_frame_tx, stream_publish_frame_rx) =
+            crossbeam::bounded::<StreamPublishFrame>(4);
+        let (stream_publish_event_tx, stream_publish_event_rx) =
+            crossbeam::bounded::<StreamPublishEvent>(4);
 
         AppState::new(
             dave,
@@ -294,6 +388,10 @@ mod tests {
             music_pcm_tx,
             music_pcm_rx,
             music_event_tx,
+            stream_publish_frame_tx,
+            stream_publish_frame_rx,
+            stream_publish_event_tx,
+            stream_publish_event_rx,
         )
     }
 

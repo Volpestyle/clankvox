@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -44,6 +44,10 @@ struct ReadyPayload {
     modes: Vec<String>,
     #[serde(default)]
     experiments: Vec<String>,
+    #[serde(default)]
+    video_ssrc: Option<u32>,
+    #[serde(default)]
+    streams: Vec<RemoteVideoStreamPayload>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -167,13 +171,16 @@ fn parse_user_id(user_id: &str, context: &str) -> Option<u64> {
 
 pub enum VoiceEvent {
     Ready {
+        role: TransportRole,
         ssrc: u32,
     },
     SsrcUpdate {
+        role: TransportRole,
         ssrc: u32,
         user_id: u64,
     },
     VideoStateUpdate {
+        role: TransportRole,
         user_id: u64,
         audio_ssrc: Option<u32>,
         video_ssrc: Option<u32>,
@@ -181,13 +188,16 @@ pub enum VoiceEvent {
         streams: Vec<VideoStreamDescriptor>,
     },
     ClientDisconnect {
+        role: TransportRole,
         user_id: u64,
     },
     OpusReceived {
+        role: TransportRole,
         ssrc: u32,
         opus_frame: Vec<u8>,
     },
     VideoFrameReceived {
+        role: TransportRole,
         user_id: u64,
         ssrc: u32,
         codec: String,
@@ -197,8 +207,11 @@ pub enum VoiceEvent {
         stream_type: Option<String>,
         rid: Option<String>,
     },
-    DaveReady,
+    DaveReady {
+        role: TransportRole,
+    },
     Disconnected {
+        role: TransportRole,
         reason: String,
     },
 }
@@ -223,11 +236,48 @@ const H264_RTX_PT: u8 = 104;
 const VP8_PT: u8 = 105;
 const VP8_RTX_PT: u8 = 106;
 const MAX_VIDEO_FRAME_BYTES: usize = 8 * 1024 * 1024;
+const VIDEO_RTP_EXTENSION_HEADER: [u8; 4] = [0xbe, 0xde, 0x00, 0x01];
+const VIDEO_RTP_EXTENSION_PAYLOAD: [u8; 4] = [0x51, 0x00, 0x00, 0x00];
+const MAX_VIDEO_RTP_CHUNK_BYTES: usize = 1_100;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportRole {
+    Voice,
+    StreamWatch,
+    StreamPublish,
+}
+
+impl TransportRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Voice => "voice",
+            Self::StreamWatch => "stream_watch",
+            Self::StreamPublish => "stream_publish",
+        }
+    }
+}
 
 fn build_rtp_header(sequence: u16, timestamp: u32, ssrc: u32) -> [u8; RTP_HEADER_LEN] {
     let mut h = [0u8; RTP_HEADER_LEN];
     h[0] = 0x80; // V=2, P=0, X=0, CC=0
     h[1] = OPUS_PT;
+    h[2..4].copy_from_slice(&sequence.to_be_bytes());
+    h[4..8].copy_from_slice(&timestamp.to_be_bytes());
+    h[8..12].copy_from_slice(&ssrc.to_be_bytes());
+    h
+}
+
+fn build_video_rtp_header(
+    payload_type: u8,
+    sequence: u16,
+    timestamp: u32,
+    ssrc: u32,
+    marker: bool,
+) -> [u8; RTP_HEADER_LEN] {
+    let mut h = [0u8; RTP_HEADER_LEN];
+    h[0] = 0x90; // V=2, X=1
+    h[1] = payload_type | if marker { 0x80 } else { 0x00 };
     h[2..4].copy_from_slice(&sequence.to_be_bytes());
     h[4..8].copy_from_slice(&timestamp.to_be_bytes());
     h[8..12].copy_from_slice(&ssrc.to_be_bytes());
@@ -608,6 +658,20 @@ fn parse_vp8_payload_descriptor(payload: &[u8]) -> Option<(usize, bool)> {
     Some((cursor, s && partition_id == 0))
 }
 
+fn find_next_start_code(data: &[u8], from: usize) -> Option<(usize, usize)> {
+    let mut index = from;
+    while index + 3 <= data.len() {
+        if data[index..].starts_with(&[0, 0, 1]) {
+            return Some((index, 3));
+        }
+        if index + 4 <= data.len() && data[index..].starts_with(&[0, 0, 0, 1]) {
+            return Some((index, 4));
+        }
+        index += 1;
+    }
+    None
+}
+
 fn h264_annexb_is_keyframe(frame: &[u8]) -> bool {
     let mut index = 0usize;
     while index + 4 <= frame.len() {
@@ -634,6 +698,22 @@ fn h264_annexb_is_keyframe(frame: &[u8]) -> bool {
         }
     }
     false
+}
+
+fn split_h264_annexb_nalus(frame: &[u8]) -> Vec<&[u8]> {
+    let mut nalus = Vec::new();
+    let mut search_from = 0usize;
+    while let Some((start, start_code_len)) = find_next_start_code(frame, search_from) {
+        let nal_start = start + start_code_len;
+        let nal_end = find_next_start_code(frame, nal_start)
+            .map(|(next_start, _)| next_start)
+            .unwrap_or(frame.len());
+        if nal_start < nal_end {
+            nalus.push(&frame[nal_start..nal_end]);
+        }
+        search_from = nal_end;
+    }
+    nalus
 }
 
 fn normalize_stream_type(stream_type: Option<String>) -> Option<String> {
@@ -663,6 +743,85 @@ fn convert_video_stream_descriptor(
     })
 }
 
+fn ready_video_stream_descriptors(ready: &ReadyPayload) -> Vec<VideoStreamDescriptor> {
+    ready
+        .streams
+        .clone()
+        .into_iter()
+        .filter_map(convert_video_stream_descriptor)
+        .collect()
+}
+
+fn default_publish_video_stream_descriptor(video_ssrc: u32) -> VideoStreamDescriptor {
+    VideoStreamDescriptor {
+        ssrc: video_ssrc,
+        rtx_ssrc: None,
+        rid: Some("100".to_string()),
+        quality: Some(100),
+        stream_type: Some("screen".to_string()),
+        active: Some(true),
+        max_bitrate: Some(2_500_000),
+        max_framerate: Some(30),
+        max_resolution: Some(VideoResolution {
+            width: Some(1280),
+            height: Some(720),
+            resolution_type: Some("fixed".to_string()),
+        }),
+    }
+}
+
+fn ready_publish_video_stream_descriptors(ready: &ReadyPayload) -> Vec<VideoStreamDescriptor> {
+    let streams = ready_video_stream_descriptors(ready);
+    if !streams.is_empty() {
+        return streams;
+    }
+    ready
+        .video_ssrc
+        .filter(|ssrc| *ssrc != 0)
+        .map(default_publish_video_stream_descriptor)
+        .into_iter()
+        .collect()
+}
+
+fn build_video_state_announcement(
+    audio_ssrc: u32,
+    streams: &[VideoStreamDescriptor],
+    active: bool,
+) -> Option<Value> {
+    let primary_stream = streams
+        .iter()
+        .find(|stream| stream.is_active())
+        .or_else(|| streams.first())?;
+    Some(json!({
+        "op": 12,
+        "d": {
+            "audio_ssrc": audio_ssrc,
+            "video_ssrc": primary_stream.ssrc,
+            "rtx_ssrc": primary_stream.rtx_ssrc,
+            "streams": streams.iter().map(|stream| json!({
+                "type": stream.stream_type,
+                "rid": stream.rid,
+                "ssrc": stream.ssrc,
+                "rtx_ssrc": stream.rtx_ssrc,
+                "active": active,
+                "quality": stream.quality,
+                "max_bitrate": stream.max_bitrate,
+                "max_framerate": stream.max_framerate,
+                "max_resolution": stream.max_resolution.as_ref().map(|resolution| json!({
+                    "type": resolution.resolution_type,
+                    "width": resolution.width,
+                    "height": resolution.height,
+                })),
+            })).collect::<Vec<_>>()
+        }
+    }))
+}
+
+fn build_inactive_video_state_announcement(audio_ssrc: u32, ready: &ReadyPayload) -> Option<Value> {
+    let streams = ready_video_stream_descriptors(ready);
+    build_video_state_announcement(audio_ssrc, &streams, false)
+}
+
 fn update_current_video_codec(codec_state: &Arc<Mutex<Option<String>>>, codec: Option<String>) {
     if let Some(codec) = codec.filter(|codec| !codec.trim().is_empty()) {
         let normalized = VideoCodecKind::from_name(&codec)
@@ -672,17 +831,31 @@ fn update_current_video_codec(codec_state: &Arc<Mutex<Option<String>>>, codec: O
     }
 }
 
+fn json_object_keys(value: &Value) -> Vec<String> {
+    value
+        .as_object()
+        .map(|object| object.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default()
+}
+
 async fn apply_remote_video_state(
     payload: RemoteVideoStatePayload,
     event_tx: &mpsc::Sender<VoiceEvent>,
     video_ssrc_map: &Arc<Mutex<HashMap<u32, RemoteVideoTrackBinding>>>,
     current_video_codec: &Arc<Mutex<Option<String>>>,
+    role: TransportRole,
 ) {
-    let Some(user_id) = payload
-        .user_id
-        .as_deref()
-        .and_then(|user_id| parse_user_id(user_id, "video_state"))
-    else {
+    let stream_count = payload.streams.len();
+    let Some(raw_user_id) = payload.user_id.as_deref() else {
+        warn!(
+            audio_ssrc = payload.audio_ssrc,
+            video_ssrc = payload.video_ssrc,
+            stream_count,
+            "ignoring video state payload without user_id"
+        );
+        return;
+    };
+    let Some(user_id) = parse_user_id(raw_user_id, "video_state") else {
         return;
     };
 
@@ -743,8 +916,21 @@ async fn apply_remote_video_state(
     }
 
     let codec = current_video_codec.lock().clone();
+    let stream_ssrcs = streams.iter().map(|stream| stream.ssrc).collect::<Vec<_>>();
+    let active_stream_count = streams.iter().filter(|stream| stream.is_active()).count();
+    info!(
+        user_id,
+        audio_ssrc = audio_ssrc,
+        video_ssrc = video_ssrc,
+        codec = ?codec.as_deref(),
+        stream_count = streams.len(),
+        active_stream_count,
+        stream_ssrcs = ?stream_ssrcs,
+        "clankvox_discord_video_state_observed"
+    );
     let _ = event_tx
         .send(VoiceEvent::VideoStateUpdate {
+            role,
             user_id,
             audio_ssrc,
             video_ssrc,
@@ -759,22 +945,36 @@ fn build_select_protocol_payload(
     external_port: u16,
     mode: &str,
     experiments: &[String],
+    role: TransportRole,
 ) -> Value {
-    let video_codecs = [VideoCodecKind::H264, VideoCodecKind::Vp8]
-        .into_iter()
-        .enumerate()
-        .map(|(idx, codec)| {
-            json!({
-                "name": codec.as_str(),
-                "type": "video",
-                "priority": 900u32.saturating_sub(idx as u32 * 10),
-                "payload_type": codec.payload_type(),
-                "rtx_payload_type": codec.rtx_payload_type(),
-                "encode": false,
-                "decode": true,
-            })
-        })
-        .collect::<Vec<_>>();
+    let video_codecs = match role {
+        TransportRole::StreamPublish => vec![json!({
+            "name": VideoCodecKind::H264.as_str(),
+            "type": "video",
+            "priority": 900,
+            "payload_type": VideoCodecKind::H264.payload_type(),
+            "rtx_payload_type": VideoCodecKind::H264.rtx_payload_type(),
+            "encode": true,
+            "decode": false,
+        })],
+        TransportRole::Voice | TransportRole::StreamWatch => {
+            [VideoCodecKind::H264, VideoCodecKind::Vp8]
+                .into_iter()
+                .enumerate()
+                .map(|(idx, codec)| {
+                    json!({
+                        "name": codec.as_str(),
+                        "type": "video",
+                        "priority": 900u32.saturating_sub(idx as u32 * 10),
+                        "payload_type": codec.payload_type(),
+                        "rtx_payload_type": codec.rtx_payload_type(),
+                        "encode": false,
+                        "decode": true,
+                    })
+                })
+                .collect::<Vec<_>>()
+        }
+    };
 
     let mut codecs = vec![json!({
         "name": "opus",
@@ -863,11 +1063,12 @@ enum TransportCipher {
 
 pub struct VoiceConnectionParams<'a> {
     pub endpoint: &'a str,
-    pub guild_id: u64,
+    pub server_id: u64,
     pub user_id: u64,
     pub session_id: &'a str,
     pub token: &'a str,
-    pub channel_id: u64,
+    pub dave_channel_id: u64,
+    pub role: TransportRole,
 }
 
 impl TransportCrypto {
@@ -1023,11 +1224,17 @@ async fn ip_discovery(socket: &UdpSocket, ssrc: u32) -> Result<(String, u16)> {
 
 pub struct VoiceConnection {
     pub ssrc: u32,
+    role: TransportRole,
     shutdown: Arc<AtomicBool>,
     udp_socket: Arc<UdpSocket>,
     crypto: Arc<TransportCrypto>,
     rtp_sequence: AtomicU32,
     timestamp: AtomicU32,
+    video_payload_type: u8,
+    video_ssrc: Option<u32>,
+    video_streams: Vec<VideoStreamDescriptor>,
+    video_sequence: AtomicU32,
+    video_timestamp: AtomicU32,
     ws_cmd_tx: mpsc::Sender<WsCommand>,
     ws_read_task: JoinHandle<()>,
     ws_write_task: JoinHandle<()>,
@@ -1044,11 +1251,12 @@ impl VoiceConnection {
     ) -> Result<Self> {
         let VoiceConnectionParams {
             endpoint,
-            guild_id,
+            server_id,
             user_id,
             session_id,
             token,
-            channel_id,
+            dave_channel_id,
+            role,
         } = params;
 
         let ep = endpoint.trim_start_matches("wss://").trim_end_matches('/');
@@ -1063,16 +1271,20 @@ impl VoiceConnection {
         // ---- OP8 Hello ----
         let heartbeat_interval = recv_hello(&mut ws_read).await?;
 
-        // ---- OP0 Identify (advertise DAVE v1 + v9 channel_id support) ----
+        // ---- OP0 Identify (advertise DAVE v1 + v9 channel_id + video receive) ----
         let identify = json!({
             "op": 0,
             "d": {
-                "server_id": guild_id.to_string(),
+                "server_id": server_id.to_string(),
                 "user_id": user_id.to_string(),
                 "session_id": session_id,
                 "token": token,
-                "channel_id": channel_id.to_string(),
-                "max_dave_protocol_version": 1
+                "channel_id": dave_channel_id.to_string(),
+                "max_dave_protocol_version": 1,
+                "video": true,
+                "streams": [
+                    { "type": "screen", "rid": "100", "quality": 100 }
+                ]
             }
         });
         ws_write
@@ -1088,9 +1300,21 @@ impl VoiceConnection {
 
         // ---- OP2 Ready ----
         let ready = recv_ready(&mut ws_read, &mut handshake_overflow).await?;
+        let ready_stream_ssrcs = ready
+            .streams
+            .iter()
+            .filter_map(|stream| stream.ssrc.filter(|ssrc| *ssrc != 0))
+            .collect::<Vec<_>>();
         info!(
-            "Voice Ready: ssrc={} udp={}:{} modes={:?} experiments={:?}",
-            ready.ssrc, ready.ip, ready.port, ready.modes, ready.experiments
+            ssrc = ready.ssrc,
+            video_ssrc = ready.video_ssrc,
+            ready_stream_count = ready_stream_ssrcs.len(),
+            ready_stream_ssrcs = ?ready_stream_ssrcs,
+            udp_ip = %ready.ip,
+            udp_port = ready.port,
+            modes = ?ready.modes,
+            experiments = ?ready.experiments,
+            "clankvox_voice_ready"
         );
 
         // ---- UDP socket + IP discovery ----
@@ -1120,8 +1344,13 @@ impl VoiceConnection {
         };
 
         // ---- OP1 Select Protocol ----
-        let select =
-            build_select_protocol_payload(&external_ip, external_port, mode, &ready.experiments);
+        let select = build_select_protocol_payload(
+            &external_ip,
+            external_port,
+            mode,
+            &ready.experiments,
+            role,
+        );
         ws_write
             .send(Message::Text(select.to_string()))
             .await
@@ -1137,6 +1366,17 @@ impl VoiceConnection {
             session_description.video_codec,
             session_description.media_session_id
         );
+        if role == TransportRole::StreamPublish
+            && session_description
+                .video_codec
+                .as_deref()
+                .is_some_and(|codec| !codec.eq_ignore_ascii_case("h264"))
+        {
+            bail!(
+                "stream publish negotiated unsupported video codec {:?}",
+                session_description.video_codec
+            );
+        }
 
         let current_video_codec = Arc::new(Mutex::new(None::<String>));
         update_current_video_codec(
@@ -1148,7 +1388,7 @@ impl VoiceConnection {
             match DaveManager::new(
                 session_description.dave_protocol_version,
                 user_id,
-                channel_id,
+                dave_channel_id,
             ) {
                 Ok((dm, pkg)) => {
                     *dave.lock() = Some(dm);
@@ -1216,7 +1456,8 @@ impl VoiceConnection {
                                     &video_ssrc_map,
                                     &current_video_codec,
                                     user_id,
-                                    channel_id,
+                                    dave_channel_id,
+                                    role,
                                     &ws_sequence,
                                 )
                                 .await;
@@ -1234,8 +1475,15 @@ impl VoiceConnection {
                                 seq,
                                 data.len()
                             );
-                            handle_binary_opcode(data, &event_tx, &ws_cmd_tx, &dave, &ws_sequence)
-                                .await;
+                            handle_binary_opcode(
+                                data,
+                                &event_tx,
+                                &ws_cmd_tx,
+                                &dave,
+                                role,
+                                &ws_sequence,
+                            )
+                            .await;
                         }
                         Message::Binary(_) => {
                             info!("Replay [{i}]: Empty Binary");
@@ -1255,7 +1503,8 @@ impl VoiceConnection {
                     current_video_codec,
                     shutdown,
                     user_id,
-                    channel_id,
+                    dave_channel_id,
+                    role,
                     ws_sequence,
                     disconnect_sent,
                 )
@@ -1275,6 +1524,7 @@ impl VoiceConnection {
                     ws_cmd_rx,
                     shutdown,
                     heartbeat_interval,
+                    role,
                     ws_sequence,
                     event_tx,
                     disconnect_sent,
@@ -1304,29 +1554,78 @@ impl VoiceConnection {
                     event_tx,
                     ws_cmd_tx,
                     shutdown,
+                    role,
                     disconnect_sent,
                 )
                 .await;
             })
         };
 
-        // Set speaking state so Discord knows we may transmit audio.
-        let _ = ws_cmd_tx
-            .send(WsCommand::SendJson(json!({
-                "op": 5,
-                "d": { "speaking": 1, "delay": 0, "ssrc": ready.ssrc }
-            })))
-            .await;
+        if role == TransportRole::Voice {
+            // Set speaking state so Discord knows we may transmit audio.
+            let _ = ws_cmd_tx
+                .send(WsCommand::SendJson(json!({
+                    "op": 5,
+                    "d": { "speaking": 1, "delay": 0, "ssrc": ready.ssrc }
+                })))
+                .await;
+        }
 
-        let _ = event_tx.send(VoiceEvent::Ready { ssrc: ready.ssrc }).await;
+        // Announce video capability (OP12) so Discord sends us other users' video states.
+        // We declare our streams as inactive (we only receive, not send video).
+        if let Some(video_state_announcement) =
+            build_inactive_video_state_announcement(ready.ssrc, &ready)
+        {
+            let announced_video_ssrc = video_state_announcement["d"]["video_ssrc"].as_u64();
+            let announced_stream_ssrcs = video_state_announcement["d"]["streams"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|stream| stream["ssrc"].as_u64())
+                .collect::<Vec<_>>();
+            info!(
+                audio_ssrc = ready.ssrc,
+                announced_video_ssrc,
+                announced_stream_count = announced_stream_ssrcs.len(),
+                announced_stream_ssrcs = ?announced_stream_ssrcs,
+                "clankvox_sending_inactive_video_state_announcement"
+            );
+            let _ = ws_cmd_tx
+                .send(WsCommand::SendJson(video_state_announcement))
+                .await;
+        } else {
+            info!("No usable stream metadata in OP2 Ready, skipping OP12 video state announcement");
+        }
+
+        let _ = event_tx
+            .send(VoiceEvent::Ready {
+                role,
+                ssrc: ready.ssrc,
+            })
+            .await;
 
         Ok(VoiceConnection {
             ssrc: ready.ssrc,
+            role,
             shutdown,
             udp_socket: udp,
             crypto,
             rtp_sequence: AtomicU32::new(0),
             timestamp: AtomicU32::new(0),
+            video_payload_type: VideoCodecKind::H264.payload_type(),
+            video_ssrc: ready.video_ssrc.filter(|ssrc| *ssrc != 0).or_else(|| {
+                ready_publish_video_stream_descriptors(&ready)
+                    .first()
+                    .map(|stream| stream.ssrc)
+            }),
+            video_streams: match role {
+                TransportRole::StreamPublish => ready_publish_video_stream_descriptors(&ready),
+                TransportRole::Voice | TransportRole::StreamWatch => {
+                    ready_video_stream_descriptors(&ready)
+                }
+            },
+            video_sequence: AtomicU32::new(0),
+            video_timestamp: AtomicU32::new(0),
             ws_cmd_tx,
             ws_read_task,
             ws_write_task,
@@ -1349,6 +1648,141 @@ impl VoiceConnection {
 
         self.udp_socket.send(&packet).await.context("UDP send")?;
         Ok(())
+    }
+
+    pub async fn send_h264_frame(
+        &self,
+        access_unit: &[u8],
+        timestamp_increment: u32,
+    ) -> Result<()> {
+        let Some(video_ssrc) = self.video_ssrc else {
+            bail!("stream publish video_ssrc unavailable");
+        };
+
+        let nalus = split_h264_annexb_nalus(access_unit);
+        if nalus.is_empty() {
+            bail!("stream publish frame did not contain Annex-B NAL units");
+        }
+
+        let timestamp = self
+            .video_timestamp
+            .fetch_add(timestamp_increment.max(1), Ordering::SeqCst);
+
+        for (nal_index, nal) in nalus.iter().enumerate() {
+            if nal.is_empty() {
+                continue;
+            }
+            let is_last_nal = nal_index + 1 == nalus.len();
+            let max_single_nal_payload =
+                MAX_VIDEO_RTP_CHUNK_BYTES.saturating_sub(VIDEO_RTP_EXTENSION_PAYLOAD.len());
+            if nal.len() <= max_single_nal_payload {
+                let seq = self.video_sequence.fetch_add(1, Ordering::SeqCst) as u16;
+                let header = build_video_rtp_header(
+                    self.video_payload_type,
+                    seq,
+                    timestamp,
+                    video_ssrc,
+                    is_last_nal,
+                );
+                let mut aad = Vec::with_capacity(RTP_HEADER_LEN + VIDEO_RTP_EXTENSION_HEADER.len());
+                aad.extend_from_slice(&header);
+                aad.extend_from_slice(&VIDEO_RTP_EXTENSION_HEADER);
+                let mut payload = Vec::with_capacity(VIDEO_RTP_EXTENSION_PAYLOAD.len() + nal.len());
+                payload.extend_from_slice(&VIDEO_RTP_EXTENSION_PAYLOAD);
+                payload.extend_from_slice(nal);
+                let encrypted = self.crypto.encrypt(&aad, &payload)?;
+                let mut packet = Vec::with_capacity(
+                    RTP_HEADER_LEN + VIDEO_RTP_EXTENSION_HEADER.len() + encrypted.len(),
+                );
+                packet.extend_from_slice(&header);
+                packet.extend_from_slice(&VIDEO_RTP_EXTENSION_HEADER);
+                packet.extend_from_slice(&encrypted);
+                self.udp_socket
+                    .send(&packet)
+                    .await
+                    .context("UDP send video packet")?;
+                continue;
+            }
+
+            let nal_header = nal[0];
+            let nal_type = nal_header & 0x1f;
+            let fnri = nal_header & 0xe0;
+            let fu_indicator = fnri | 28;
+            let max_fu_payload = MAX_VIDEO_RTP_CHUNK_BYTES
+                .saturating_sub(VIDEO_RTP_EXTENSION_PAYLOAD.len())
+                .saturating_sub(2);
+            for (chunk_index, chunk) in nal[1..].chunks(max_fu_payload).enumerate() {
+                let is_first_chunk = chunk_index == 0;
+                let chunk_start = chunk_index * max_fu_payload;
+                let is_last_chunk = chunk_start + chunk.len() >= nal.len().saturating_sub(1);
+                let marker = is_last_nal && is_last_chunk;
+                let seq = self.video_sequence.fetch_add(1, Ordering::SeqCst) as u16;
+                let header = build_video_rtp_header(
+                    self.video_payload_type,
+                    seq,
+                    timestamp,
+                    video_ssrc,
+                    marker,
+                );
+                let fu_header = (if is_first_chunk { 0x80 } else { 0x00 })
+                    | (if is_last_chunk { 0x40 } else { 0x00 })
+                    | nal_type;
+                let mut aad = Vec::with_capacity(RTP_HEADER_LEN + VIDEO_RTP_EXTENSION_HEADER.len());
+                aad.extend_from_slice(&header);
+                aad.extend_from_slice(&VIDEO_RTP_EXTENSION_HEADER);
+                let mut payload =
+                    Vec::with_capacity(VIDEO_RTP_EXTENSION_PAYLOAD.len() + 2 + chunk.len());
+                payload.extend_from_slice(&VIDEO_RTP_EXTENSION_PAYLOAD);
+                payload.extend_from_slice(&[fu_indicator, fu_header]);
+                payload.extend_from_slice(chunk);
+                let encrypted = self.crypto.encrypt(&aad, &payload)?;
+                let mut packet = Vec::with_capacity(
+                    RTP_HEADER_LEN + VIDEO_RTP_EXTENSION_HEADER.len() + encrypted.len(),
+                );
+                packet.extend_from_slice(&header);
+                packet.extend_from_slice(&VIDEO_RTP_EXTENSION_HEADER);
+                packet.extend_from_slice(&encrypted);
+                self.udp_socket
+                    .send(&packet)
+                    .await
+                    .context("UDP send video FU-A packet")?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn set_stream_publish_speaking(&self, speaking: bool) -> Result<()> {
+        if self.role != TransportRole::StreamPublish {
+            return Ok(());
+        }
+        self.ws_cmd_tx
+            .try_send(WsCommand::SendJson(json!({
+                "op": 5,
+                "d": {
+                    "speaking": if speaking { 2 } else { 0 },
+                    "delay": 0,
+                    "ssrc": self.ssrc,
+                }
+            })))
+            .map_err(|error| {
+                anyhow::anyhow!("failed to enqueue stream publish speaking update: {error}")
+            })
+    }
+
+    pub fn set_stream_publish_video_active(&self, active: bool) -> Result<()> {
+        if self.role != TransportRole::StreamPublish {
+            return Ok(());
+        }
+        let Some(payload) = build_video_state_announcement(self.ssrc, &self.video_streams, active)
+        else {
+            return Ok(());
+        };
+        self.ws_cmd_tx
+            .try_send(WsCommand::SendJson(payload))
+            .map_err(|error| {
+                anyhow::anyhow!("failed to enqueue stream publish video state update: {error}")
+            })
     }
 
     pub fn update_media_sink_wants(
@@ -1379,6 +1813,7 @@ impl Drop for VoiceConnection {
 async fn send_disconnect_once(
     event_tx: &mpsc::Sender<VoiceEvent>,
     disconnect_sent: &Arc<AtomicBool>,
+    role: TransportRole,
     reason: impl Into<String>,
 ) {
     if disconnect_sent
@@ -1387,6 +1822,7 @@ async fn send_disconnect_once(
     {
         let _ = event_tx
             .send(VoiceEvent::Disconnected {
+                role,
                 reason: reason.into(),
             })
             .await;
@@ -1516,6 +1952,7 @@ async fn ws_read_loop(
     shutdown: Arc<AtomicBool>,
     bot_user_id: u64,
     channel_id: u64,
+    role: TransportRole,
     ws_sequence: Arc<AtomicI32>,
     disconnect_sent: Arc<AtomicBool>,
 ) {
@@ -1548,6 +1985,7 @@ async fn ws_read_loop(
                     &current_video_codec,
                     bot_user_id,
                     channel_id,
+                    role,
                     &ws_sequence,
                 )
                 .await;
@@ -1556,7 +1994,7 @@ async fn ws_read_loop(
                 if data.is_empty() {
                     continue;
                 }
-                handle_binary_opcode(&data, &event_tx, &ws_cmd_tx, &dave, &ws_sequence).await;
+                handle_binary_opcode(&data, &event_tx, &ws_cmd_tx, &dave, role, &ws_sequence).await;
             }
             Ok(Message::Close(frame)) => {
                 let reason = match frame {
@@ -1567,12 +2005,17 @@ async fn ws_read_loop(
                     None => "WebSocket closed by server (no close frame)".into(),
                 };
                 warn!("{reason}");
-                send_disconnect_once(&event_tx, &disconnect_sent, reason).await;
+                send_disconnect_once(&event_tx, &disconnect_sent, role, reason).await;
                 break;
             }
             Err(e) => {
-                send_disconnect_once(&event_tx, &disconnect_sent, format!("WS read error: {e}"))
-                    .await;
+                send_disconnect_once(
+                    &event_tx,
+                    &disconnect_sent,
+                    role,
+                    format!("WS read error: {e}"),
+                )
+                .await;
                 break;
             }
             _ => {}
@@ -1593,6 +2036,7 @@ async fn handle_text_opcode(
     current_video_codec: &Arc<Mutex<Option<String>>>,
     bot_user_id: u64,
     channel_id: u64,
+    role: TransportRole,
     _ws_sequence: &Arc<AtomicI32>,
 ) {
     match op {
@@ -1617,24 +2061,89 @@ async fn handle_text_opcode(
 
             let _ = event_tx
                 .send(VoiceEvent::SsrcUpdate {
+                    role,
                     ssrc: payload.ssrc,
                     user_id: uid,
                 })
                 .await;
         }
         // Video stream metadata (Discord may send this as OP12 or OP18 depending on path)
-        12 | 18 if d.get("streams").is_some() || d.get("video_ssrc").is_some() => {
-            let payload: RemoteVideoStatePayload = match serde_json::from_value(d.clone()) {
+        12 | 18 => {
+            let has_streams = d.get("streams").is_some();
+            let has_video_ssrc = d.get("video_ssrc").is_some();
+            let has_audio_ssrc = d.get("audio_ssrc").is_some();
+            let has_user_id = d.get("user_id").is_some();
+            let payload_keys = json_object_keys(d);
+
+            if has_streams || has_video_ssrc {
+                let payload: RemoteVideoStatePayload = match serde_json::from_value(d.clone()) {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        warn!(
+                            error = %error,
+                            op,
+                            has_streams,
+                            has_video_ssrc,
+                            has_audio_ssrc,
+                            has_user_id,
+                            payload_keys = ?payload_keys,
+                            "ignoring malformed video state payload"
+                        );
+                        return;
+                    }
+                };
+                apply_remote_video_state(
+                    payload,
+                    event_tx,
+                    video_ssrc_map,
+                    current_video_codec,
+                    role,
+                )
+                .await;
+                return;
+            }
+
+            if op == 18 {
+                info!(
+                    has_streams,
+                    has_video_ssrc,
+                    has_audio_ssrc,
+                    has_user_id,
+                    payload_keys = ?payload_keys,
+                    "clankvox_voice_ws_unclassified_op18"
+                );
+                return;
+            }
+
+            // Client disconnect (OP13 in current Discord docs, but some servers historically used OP12)
+            let payload: UserIdPayload = match serde_json::from_value(d.clone()) {
                 Ok(payload) => payload,
                 Err(error) => {
-                    warn!(error = %error, op, "ignoring malformed video state payload");
+                    warn!(
+                        error = %error,
+                        op,
+                        has_streams,
+                        has_video_ssrc,
+                        has_audio_ssrc,
+                        has_user_id,
+                        payload_keys = ?payload_keys,
+                        "ignoring malformed client disconnect payload"
+                    );
                     return;
                 }
             };
-            apply_remote_video_state(payload, event_tx, video_ssrc_map, current_video_codec).await;
+            let Some(uid) = parse_user_id(&payload.user_id, "client_disconnect") else {
+                return;
+            };
+            ssrc_map.lock().retain(|_, v| *v != uid);
+            video_ssrc_map
+                .lock()
+                .retain(|_, binding| binding.user_id != uid);
+            let _ = event_tx
+                .send(VoiceEvent::ClientDisconnect { role, user_id: uid })
+                .await;
         }
-        // Client disconnect (OP13 in current Discord docs, but some servers historically used OP12)
-        12 | 13 => {
+        13 => {
             let payload: UserIdPayload = match serde_json::from_value(d.clone()) {
                 Ok(payload) => payload,
                 Err(error) => {
@@ -1650,7 +2159,7 @@ async fn handle_text_opcode(
                 .lock()
                 .retain(|_, binding| binding.user_id != uid);
             let _ = event_tx
-                .send(VoiceEvent::ClientDisconnect { user_id: uid })
+                .send(VoiceEvent::ClientDisconnect { role, user_id: uid })
                 .await;
         }
         // Session update / codec update
@@ -1725,7 +2234,7 @@ async fn handle_text_opcode(
                     guard.as_ref().is_some_and(DaveManager::is_ready)
                 };
                 if ready {
-                    let _ = event_tx.send(VoiceEvent::DaveReady).await;
+                    let _ = event_tx.send(VoiceEvent::DaveReady { role }).await;
                 }
             }
         }
@@ -1795,6 +2304,7 @@ async fn handle_binary_opcode(
     event_tx: &mpsc::Sender<VoiceEvent>,
     ws_cmd_tx: &mpsc::Sender<WsCommand>,
     dave: &Arc<Mutex<Option<DaveManager>>>,
+    role: TransportRole,
     ws_sequence: &Arc<AtomicI32>,
 ) {
     // Incoming binary frames from Discord Voice WebSocket have the format:
@@ -1934,7 +2444,7 @@ async fn handle_binary_opcode(
             }
 
             if ready {
-                let _ = event_tx.send(VoiceEvent::DaveReady).await;
+                let _ = event_tx.send(VoiceEvent::DaveReady { role }).await;
             }
         }
         // OP30: MLS Welcome (server → client)
@@ -2005,7 +2515,7 @@ async fn handle_binary_opcode(
             }
 
             if ready {
-                let _ = event_tx.send(VoiceEvent::DaveReady).await;
+                let _ = event_tx.send(VoiceEvent::DaveReady { role }).await;
             }
         }
         // OP31: MLS Invalid Commit Welcome
@@ -2231,6 +2741,7 @@ async fn ws_write_loop(
     mut cmd_rx: mpsc::Receiver<WsCommand>,
     shutdown: Arc<AtomicBool>,
     heartbeat_interval_ms: f64,
+    role: TransportRole,
     ws_sequence: Arc<AtomicI32>,
     event_tx: mpsc::Sender<VoiceEvent>,
     disconnect_sent: Arc<AtomicBool>,
@@ -2273,6 +2784,7 @@ async fn ws_write_loop(
                     send_disconnect_once(
                         &event_tx,
                         &disconnect_sent,
+                        role,
                         format!("WS heartbeat send failed: {error}"),
                     )
                     .await;
@@ -2286,6 +2798,7 @@ async fn ws_write_loop(
                             send_disconnect_once(
                                 &event_tx,
                                 &disconnect_sent,
+                                role,
                                 format!("WS command send failed: {error}"),
                             )
                             .await;
@@ -2297,6 +2810,7 @@ async fn ws_write_loop(
                             send_disconnect_once(
                                 &event_tx,
                                 &disconnect_sent,
+                                role,
                                 format!("WS binary send failed: {error}"),
                             )
                             .await;
@@ -2322,6 +2836,7 @@ async fn udp_recv_loop(
     event_tx: mpsc::Sender<VoiceEvent>,
     ws_cmd_tx: mpsc::Sender<WsCommand>,
     shutdown: Arc<AtomicBool>,
+    role: TransportRole,
     disconnect_sent: Arc<AtomicBool>,
 ) {
     let mut buf = [0u8; 65_536];
@@ -2338,8 +2853,13 @@ async fn udp_recv_loop(
                 if shutdown.load(Ordering::Relaxed) {
                     break;
                 }
-                send_disconnect_once(&event_tx, &disconnect_sent, format!("UDP recv error: {e}"))
-                    .await;
+                send_disconnect_once(
+                    &event_tx,
+                    &disconnect_sent,
+                    role,
+                    format!("UDP recv error: {e}"),
+                )
+                .await;
                 break;
             }
         };
@@ -2471,7 +2991,11 @@ async fn udp_recv_loop(
             };
 
             let _ = event_tx
-                .send(VoiceEvent::OpusReceived { ssrc, opus_frame })
+                .send(VoiceEvent::OpusReceived {
+                    role,
+                    ssrc,
+                    opus_frame,
+                })
                 .await;
             continue;
         }
@@ -2538,6 +3062,7 @@ async fn udp_recv_loop(
 
         let _ = event_tx
             .send(VoiceEvent::VideoFrameReceived {
+                role,
                 user_id: binding.user_id,
                 ssrc,
                 codec: codec.as_str().to_string(),
@@ -2562,11 +3087,13 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::{
-        HelloPayload, OPUS_PT, RTP_HEADER_LEN, RemoteVideoStatePayload, RemoteVideoTrackBinding,
-        SessionDescriptionPayload, TransportCrypto, VideoCodecKind, VideoDepacketizers,
-        VideoFrameCandidate, VideoStreamDescriptor, VoiceEvent, VoiceOpcode,
-        apply_remote_video_state, build_rtp_header, decrypt_video_frame_candidates,
-        parse_rtp_header, parse_user_id, parse_voice_opcode, recv_ready, recv_session_description,
+        HelloPayload, OPUS_PT, RTP_HEADER_LEN, ReadyPayload, RemoteVideoResolutionPayload,
+        RemoteVideoStatePayload, RemoteVideoStreamPayload, RemoteVideoTrackBinding,
+        SessionDescriptionPayload, TransportCrypto, TransportRole, VideoCodecKind,
+        VideoDepacketizers, VideoFrameCandidate, VideoStreamDescriptor, VoiceEvent, VoiceOpcode,
+        apply_remote_video_state, build_inactive_video_state_announcement, build_rtp_header,
+        decrypt_video_frame_candidates, parse_rtp_header, parse_user_id, parse_voice_opcode,
+        recv_ready, recv_session_description,
     };
     use tokio_tungstenite::tungstenite::Message;
 
@@ -2847,6 +3374,7 @@ mod tests {
             &event_tx,
             &video_ssrc_map,
             &current_video_codec,
+            TransportRole::Voice,
         )
         .await;
 
@@ -2858,6 +3386,7 @@ mod tests {
                 video_ssrc,
                 codec,
                 streams,
+                ..
             } => {
                 assert_eq!(user_id, 42);
                 assert_eq!(audio_ssrc, Some(3001));
@@ -2915,6 +3444,7 @@ mod tests {
             &event_tx,
             &video_ssrc_map,
             &current_video_codec,
+            TransportRole::Voice,
         )
         .await;
 
@@ -2926,6 +3456,7 @@ mod tests {
                 video_ssrc,
                 codec,
                 streams,
+                ..
             } => {
                 assert_eq!(user_id, 42);
                 assert_eq!(audio_ssrc, None);
@@ -2937,6 +3468,81 @@ mod tests {
         }
 
         assert!(!video_ssrc_map.lock().contains_key(&descriptor.ssrc));
+    }
+
+    #[test]
+    fn inactive_video_state_announcement_prefers_explicit_ready_streams() {
+        let payload = build_inactive_video_state_announcement(
+            3001,
+            &ReadyPayload {
+                ssrc: 3001,
+                ip: "127.0.0.1".into(),
+                port: 5000,
+                modes: Vec::new(),
+                experiments: Vec::new(),
+                video_ssrc: Some(4001),
+                streams: vec![RemoteVideoStreamPayload {
+                    ssrc: Some(8001),
+                    rtx_ssrc: Some(8002),
+                    rid: Some("100".into()),
+                    quality: Some(100),
+                    stream_type: Some("screen".into()),
+                    active: Some(true),
+                    max_bitrate: Some(2_500_000),
+                    max_framerate: Some(30),
+                    max_resolution: Some(RemoteVideoResolutionPayload {
+                        width: Some(1920),
+                        height: Some(1080),
+                        resolution_type: Some("fixed".into()),
+                    }),
+                }],
+            },
+        )
+        .expect("announcement payload");
+
+        assert_eq!(payload["d"]["audio_ssrc"].as_u64(), Some(3001));
+        assert_eq!(payload["d"]["video_ssrc"].as_u64(), Some(8001));
+        assert_eq!(payload["d"]["rtx_ssrc"].as_u64(), Some(8002));
+        assert_eq!(payload["d"]["streams"].as_array().map(Vec::len), Some(1));
+        assert_eq!(payload["d"]["streams"][0]["ssrc"].as_u64(), Some(8001));
+        assert_eq!(payload["d"]["streams"][0]["rtx_ssrc"].as_u64(), Some(8002));
+        assert_eq!(payload["d"]["streams"][0]["active"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn inactive_video_state_announcement_skips_without_explicit_ready_streams() {
+        let payload = build_inactive_video_state_announcement(
+            3001,
+            &ReadyPayload {
+                ssrc: 3001,
+                ip: "127.0.0.1".into(),
+                port: 5000,
+                modes: Vec::new(),
+                experiments: Vec::new(),
+                video_ssrc: Some(4001),
+                streams: Vec::new(),
+            },
+        );
+
+        assert!(payload.is_none());
+    }
+
+    #[test]
+    fn inactive_video_state_announcement_skips_when_ready_has_no_video_metadata() {
+        let payload = build_inactive_video_state_announcement(
+            3001,
+            &ReadyPayload {
+                ssrc: 3001,
+                ip: "127.0.0.1".into(),
+                port: 5000,
+                modes: Vec::new(),
+                experiments: Vec::new(),
+                video_ssrc: None,
+                streams: Vec::new(),
+            },
+        );
+
+        assert!(payload.is_none());
     }
 
     #[test]

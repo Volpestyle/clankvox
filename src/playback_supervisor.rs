@@ -232,7 +232,9 @@ impl AppState {
             }
             PlaybackCommand::Destroy => {
                 self.music.stop_player();
+                self.stream_publish.reset();
                 self.clear_voice_connection();
+                self.clear_stream_publish_connection();
                 true
             }
         }
@@ -458,6 +460,7 @@ impl AppState {
     pub(crate) async fn on_audio_tick(&mut self) {
         let now = time::Instant::now();
         self.on_capture_tick(now);
+        self.drain_stream_publish_runtime_events();
 
         self.tick_pending_music_start(now);
 
@@ -529,6 +532,8 @@ impl AppState {
                 }
             }
         }
+
+        self.send_pending_stream_publish_frame().await;
     }
 }
 
@@ -543,6 +548,7 @@ mod tests {
     use super::AppState;
     use crate::audio_pipeline::{AUDIO_FRAME_SAMPLES, AudioSendState, MAX_MUSIC_BUFFER_SAMPLES};
     use crate::ipc_protocol::PlaybackCommand;
+    use crate::stream_publish::{StreamPublishEvent, StreamPublishFrame};
 
     fn make_app_state_with_music_queue_capacity(queue_capacity: usize) -> AppState {
         let (_voice_event_tx, voice_event_rx) = mpsc::channel(4);
@@ -554,6 +560,10 @@ mod tests {
             AudioSendState::new().expect("audio state"),
         )));
         let (music_pcm_tx, music_pcm_rx) = crossbeam::bounded::<Vec<i16>>(queue_capacity);
+        let (stream_publish_frame_tx, stream_publish_frame_rx) =
+            crossbeam::bounded::<StreamPublishFrame>(4);
+        let (stream_publish_event_tx, stream_publish_event_rx) =
+            crossbeam::bounded::<StreamPublishEvent>(4);
 
         AppState::new(
             Arc::new(Mutex::new(None)),
@@ -562,6 +572,10 @@ mod tests {
             music_pcm_tx,
             music_pcm_rx,
             music_event_tx,
+            stream_publish_frame_tx,
+            stream_publish_frame_rx,
+            stream_publish_event_tx,
+            stream_publish_event_rx,
         )
     }
 
