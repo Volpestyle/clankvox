@@ -116,6 +116,8 @@ pub enum InMsg {
         url: String,
         #[serde(rename = "resolvedDirectUrl", default)]
         resolved_direct_url: bool,
+        #[serde(rename = "visualizerMode")]
+        visualizer_mode: Option<String>,
     },
     MusicStop,
     MusicPause,
@@ -129,6 +131,13 @@ pub enum InMsg {
         url: String,
         #[serde(rename = "resolvedDirectUrl", default)]
         resolved_direct_url: bool,
+    },
+    StreamPublishPlayVisualizer {
+        url: String,
+        #[serde(rename = "resolvedDirectUrl", default)]
+        resolved_direct_url: bool,
+        #[serde(rename = "visualizerMode")]
+        visualizer_mode: String,
     },
     StreamPublishBrowserStart {
         #[serde(rename = "mimeType")]

@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::io::{self, BufRead};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -12,6 +13,10 @@ use tokio::time;
 use tracing::{info, warn};
 
 use crate::audio_pipeline::{AudioSendState, clear_audio_send_buffer};
+use crate::stream_publish::{
+    STREAM_PUBLISH_TARGET_FPS, StreamPublishFrame, VisualizerMode,
+    build_visualizer_pipeline_command, drain_h264_access_units,
+};
 
 const MUSIC_PIPELINE_STDERR_TAIL_LINES: usize = 24;
 
@@ -47,6 +52,7 @@ pub(crate) struct MusicPipelineRequest<'a> {
     pub(crate) url: &'a str,
     pub(crate) resolved_direct_url: bool,
     pub(crate) clear_output_buffers: bool,
+    pub(crate) visualizer_mode: Option<VisualizerMode>,
 }
 
 pub(crate) struct MusicPipelineContext<'a> {
@@ -55,6 +61,7 @@ pub(crate) struct MusicPipelineContext<'a> {
     pub(crate) music_pcm_tx: &'a crossbeam::Sender<Vec<i16>>,
     pub(crate) music_event_tx: &'a mpsc::Sender<MusicEvent>,
     pub(crate) audio_send_state: &'a Arc<Mutex<Option<AudioSendState>>>,
+    pub(crate) stream_publish_frame_tx: &'a crossbeam::Sender<StreamPublishFrame>,
 }
 
 pub(crate) fn start_music_pipeline(
@@ -65,6 +72,7 @@ pub(crate) fn start_music_pipeline(
         url,
         resolved_direct_url,
         clear_output_buffers,
+        visualizer_mode,
     } = request;
     let MusicPipelineContext {
         music_player,
@@ -72,6 +80,7 @@ pub(crate) fn start_music_pipeline(
         music_pcm_tx,
         music_event_tx,
         audio_send_state,
+        stream_publish_frame_tx,
     } = context;
 
     if let Some(player) = music_player {
@@ -87,10 +96,26 @@ pub(crate) fn start_music_pipeline(
         music_pcm_tx.clone(),
         music_event_tx.clone(),
         resolved_direct_url,
+        visualizer_mode,
+        stream_publish_frame_tx.clone(),
     ));
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MusicPlayerSource {
+    AudioOnly {
+        url: String,
+        resolved_direct_url: bool,
+    },
+    Visualizer {
+        url: String,
+        resolved_direct_url: bool,
+        visualizer_mode: VisualizerMode,
+    },
+}
+
 pub(crate) struct MusicPlayer {
+    source: MusicPlayerSource,
     stop: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     child_pid: Arc<AtomicU32>,
@@ -137,6 +162,47 @@ fn terminate_music_child(child: &mut std::process::Child, signal: libc::c_int) {
     }
 }
 
+fn set_fd_cloexec(fd: libc::c_int) -> io::Result<()> {
+    // SAFETY: `fd` is an open descriptor created by `pipe`, and `fcntl` is
+    // only used here to toggle the close-on-exec flag for child-process setup.
+    #[allow(unsafe_code)]
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    if rc == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn create_visualizer_audio_pipe() -> io::Result<(std::fs::File, OwnedFd)> {
+    let mut fds = [0; 2];
+    // SAFETY: `fds` points to valid writable memory for two integers, as
+    // required by `pipe`.
+    #[allow(unsafe_code)]
+    let pipe_rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    if pipe_rc == -1 {
+        return Err(io::Error::last_os_error());
+    }
+
+    if let Err(error) = set_fd_cloexec(fds[0]).and_then(|()| set_fd_cloexec(fds[1])) {
+        // SAFETY: both descriptors came directly from `pipe` above.
+        #[allow(unsafe_code)]
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+        return Err(error);
+    }
+
+    // SAFETY: ownership is transferred exactly once from the raw descriptors
+    // returned by `pipe` into Rust-owned handle types.
+    #[allow(unsafe_code)]
+    let reader = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+    #[allow(unsafe_code)]
+    let writer = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    Ok((reader, writer))
+}
+
 impl MusicPlayer {
     #[allow(clippy::too_many_lines)]
     fn start(
@@ -144,24 +210,82 @@ impl MusicPlayer {
         pcm_tx: crossbeam::Sender<Vec<i16>>,
         music_event_tx: mpsc::Sender<MusicEvent>,
         resolved_direct_url: bool,
+        visualizer_mode: Option<VisualizerMode>,
+        stream_publish_frame_tx: crossbeam::Sender<StreamPublishFrame>,
     ) -> Self {
+        let source = visualizer_mode.map_or_else(
+            || MusicPlayerSource::AudioOnly {
+                url: url.to_string(),
+                resolved_direct_url,
+            },
+            |visualizer_mode| MusicPlayerSource::Visualizer {
+                url: url.to_string(),
+                resolved_direct_url,
+                visualizer_mode,
+            },
+        );
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = stop.clone();
         let paused = Arc::new(AtomicBool::new(false));
         let paused_thread = paused.clone();
         let child_pid = Arc::new(AtomicU32::new(0));
         let child_pid_thread = child_pid.clone();
-        let url = url.to_string();
+        let source_for_thread = source.clone();
 
         let thread = std::thread::spawn(move || {
-            let pipeline_command = build_music_pipeline_command(&url, resolved_direct_url);
+            let mut audio_pipe = match &source_for_thread {
+                MusicPlayerSource::Visualizer { .. } => match create_visualizer_audio_pipe() {
+                    Ok(pipe) => Some(pipe),
+                    Err(error) => {
+                        let _ = music_event_tx.blocking_send(MusicEvent::Error(format!(
+                            "music visualizer audio pipe failed: {error}"
+                        )));
+                        return;
+                    }
+                },
+                MusicPlayerSource::AudioOnly { .. } => None,
+            };
+            let audio_pipe_writer_raw = audio_pipe.as_ref().map(|(_, writer)| writer.as_raw_fd());
+            let pipeline_command = match &source_for_thread {
+                MusicPlayerSource::AudioOnly {
+                    url,
+                    resolved_direct_url,
+                } => build_music_pipeline_command(url, *resolved_direct_url),
+                MusicPlayerSource::Visualizer {
+                    url,
+                    resolved_direct_url,
+                    visualizer_mode,
+                } => build_visualizer_pipeline_command(
+                    url,
+                    *resolved_direct_url,
+                    visualizer_mode.clone(),
+                ),
+            };
             let pipeline_started_at = time::Instant::now();
-            let child = std::process::Command::new("sh")
+            let mut command = std::process::Command::new("sh");
+            command
                 .process_group(0)
                 .args(["-c", &pipeline_command])
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn();
+                .stderr(Stdio::piped());
+
+            if let Some(audio_pipe_writer_raw) = audio_pipe_writer_raw {
+                // SAFETY: the descriptor comes from `create_visualizer_audio_pipe`,
+                // remains valid until `spawn` returns, and is duplicated onto fd 3
+                // for the shell pipeline before `exec`.
+                #[allow(unsafe_code)]
+                unsafe {
+                    command.pre_exec(move || {
+                        let rc = libc::dup2(audio_pipe_writer_raw, 3);
+                        if rc == -1 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+            }
+
+            let child = command.spawn();
 
             let mut child = match child {
                 Ok(c) => c,
@@ -172,6 +296,7 @@ impl MusicPlayer {
                     return;
                 }
             };
+            let visualizer_audio_reader = audio_pipe.take().map(|(reader, _writer)| reader);
             child_pid_thread.store(child.id(), Ordering::SeqCst);
 
             let stderr_tail = Arc::new(Mutex::new(VecDeque::<String>::new()));
@@ -196,55 +321,211 @@ impl MusicPlayer {
                 })
             });
 
-            let Some(stdout) = child.stdout.take() else {
-                let _ = music_event_tx.blocking_send(MusicEvent::Error(
-                    "music pipeline missing stdout".to_string(),
-                ));
-                terminate_music_child(&mut child, libc::SIGTERM);
-                let _ = child.wait();
-                if let Some(handle) = stderr_thread.take() {
-                    let _ = handle.join();
+            let resolved_direct_url = match &source_for_thread {
+                MusicPlayerSource::AudioOnly {
+                    resolved_direct_url,
+                    ..
                 }
-                child_pid_thread.store(0, Ordering::SeqCst);
-                return;
+                | MusicPlayerSource::Visualizer {
+                    resolved_direct_url,
+                    ..
+                } => *resolved_direct_url,
             };
 
-            let mut reader = io::BufReader::with_capacity(48000 * 2, stdout);
-            let mut chunk = vec![0u8; 960 * 2];
-            let mut first_pcm_reported = false;
+            let mut audio_thread = match source_for_thread {
+                MusicPlayerSource::AudioOnly { .. } => {
+                    let Some(stdout) = child.stdout.take() else {
+                        let _ = music_event_tx.blocking_send(MusicEvent::Error(
+                            "music pipeline missing stdout".to_string(),
+                        ));
+                        terminate_music_child(&mut child, libc::SIGTERM);
+                        let _ = child.wait();
+                        if let Some(handle) = stderr_thread.take() {
+                            let _ = handle.join();
+                        }
+                        child_pid_thread.store(0, Ordering::SeqCst);
+                        return;
+                    };
 
-            loop {
-                if stop_clone.load(Ordering::Relaxed) {
-                    break;
+                    let pcm_tx = pcm_tx.clone();
+                    let music_event_tx = music_event_tx.clone();
+                    let stop_clone = stop_clone.clone();
+                    Some(std::thread::spawn(move || {
+                        let mut reader = io::BufReader::with_capacity(48_000 * 2, stdout);
+                        let mut chunk = vec![0u8; 960 * 2];
+                        let mut first_pcm_reported = false;
+
+                        loop {
+                            if stop_clone.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            match io::Read::read_exact(&mut reader, &mut chunk) {
+                                Ok(()) => {
+                                    if !first_pcm_reported {
+                                        first_pcm_reported = true;
+                                        let startup_ms =
+                                            pipeline_started_at.elapsed().as_millis() as u64;
+                                        info!(
+                                            "music pipeline first pcm startup_ms={} direct={}",
+                                            startup_ms, resolved_direct_url
+                                        );
+                                        let _ =
+                                            music_event_tx.blocking_send(MusicEvent::FirstPcm {
+                                                startup_ms,
+                                                resolved_direct_url,
+                                            });
+                                    }
+                                    let mut samples = Vec::with_capacity(960);
+                                    for i in 0..960 {
+                                        samples.push(i16::from_le_bytes([
+                                            chunk[i * 2],
+                                            chunk[i * 2 + 1],
+                                        ]));
+                                    }
+                                    if pcm_tx.send(samples).is_err() {
+                                        break;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    }))
                 }
-                match io::Read::read_exact(&mut reader, &mut chunk) {
-                    Ok(()) => {
-                        if !first_pcm_reported {
-                            first_pcm_reported = true;
-                            let startup_ms = pipeline_started_at.elapsed().as_millis() as u64;
-                            info!(
-                                "music pipeline first pcm startup_ms={} direct={}",
-                                startup_ms, resolved_direct_url
-                            );
-                            let _ = music_event_tx.blocking_send(MusicEvent::FirstPcm {
-                                startup_ms,
-                                resolved_direct_url,
-                            });
+                MusicPlayerSource::Visualizer {
+                    visualizer_mode, ..
+                } => {
+                    let Some(mut stdout) = child.stdout.take() else {
+                        let _ = music_event_tx.blocking_send(MusicEvent::Error(
+                            "music visualizer pipeline missing video stdout".to_string(),
+                        ));
+                        terminate_music_child(&mut child, libc::SIGTERM);
+                        let _ = child.wait();
+                        if let Some(handle) = stderr_thread.take() {
+                            let _ = handle.join();
                         }
-                        let mut samples = Vec::with_capacity(960);
-                        for i in 0..960 {
-                            samples.push(i16::from_le_bytes([chunk[i * 2], chunk[i * 2 + 1]]));
+                        child_pid_thread.store(0, Ordering::SeqCst);
+                        return;
+                    };
+                    let Some(audio_reader) = visualizer_audio_reader else {
+                        let _ = music_event_tx.blocking_send(MusicEvent::Error(
+                            "music visualizer audio pipe unavailable".to_string(),
+                        ));
+                        terminate_music_child(&mut child, libc::SIGTERM);
+                        let _ = child.wait();
+                        if let Some(handle) = stderr_thread.take() {
+                            let _ = handle.join();
                         }
-                        if pcm_tx.send(samples).is_err() {
+                        child_pid_thread.store(0, Ordering::SeqCst);
+                        return;
+                    };
+                    let pcm_tx = pcm_tx.clone();
+                    let audio_music_event_tx = music_event_tx.clone();
+                    let audio_stop = stop_clone.clone();
+                    let audio_pipeline_started_at = pipeline_started_at;
+                    let audio_visualizer_mode = visualizer_mode.clone();
+                    let mut h264_buffer = Vec::<u8>::with_capacity(256 * 1024);
+                    let mut read_buffer = [0u8; 16 * 1024];
+
+                    let audio_thread = std::thread::spawn(move || {
+                        let mut reader = io::BufReader::with_capacity(48_000 * 2, audio_reader);
+                        let mut chunk = vec![0u8; 960 * 2];
+                        let mut first_pcm_reported = false;
+
+                        loop {
+                            if audio_stop.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            match io::Read::read_exact(&mut reader, &mut chunk) {
+                                Ok(()) => {
+                                    if !first_pcm_reported {
+                                        first_pcm_reported = true;
+                                        let startup_ms =
+                                            audio_pipeline_started_at.elapsed().as_millis() as u64;
+                                        info!(
+                                            visualizer_mode = %audio_visualizer_mode.as_str(),
+                                            "music visualizer first pcm startup_ms={} direct={}",
+                                            startup_ms, resolved_direct_url
+                                        );
+                                        let _ = audio_music_event_tx.blocking_send(
+                                            MusicEvent::FirstPcm {
+                                                startup_ms,
+                                                resolved_direct_url,
+                                            },
+                                        );
+                                    }
+                                    let mut samples = Vec::with_capacity(960);
+                                    for i in 0..960 {
+                                        samples.push(i16::from_le_bytes([
+                                            chunk[i * 2],
+                                            chunk[i * 2 + 1],
+                                        ]));
+                                    }
+                                    if pcm_tx.send(samples).is_err() {
+                                        break;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    });
+
+                    let mut first_frame_reported = false;
+                    loop {
+                        if stop_clone.load(Ordering::Relaxed) {
                             break;
                         }
+                        match io::Read::read(&mut stdout, &mut read_buffer) {
+                            Ok(0) => break,
+                            Ok(bytes_read) => {
+                                h264_buffer.extend_from_slice(&read_buffer[..bytes_read]);
+                                for access_unit in drain_h264_access_units(&mut h264_buffer, false)
+                                {
+                                    if !first_frame_reported {
+                                        first_frame_reported = true;
+                                        info!(
+                                            visualizer_mode = %visualizer_mode.as_str(),
+                                            "music visualizer first video frame startup_ms={}",
+                                            pipeline_started_at.elapsed().as_millis() as u64
+                                        );
+                                    }
+                                    if stream_publish_frame_tx
+                                        .send(StreamPublishFrame {
+                                            access_unit,
+                                            timestamp_increment: 90_000 / STREAM_PUBLISH_TARGET_FPS,
+                                        })
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                let _ = music_event_tx.blocking_send(MusicEvent::Error(format!(
+                                    "music visualizer video stdout read failed: {error}"
+                                )));
+                                break;
+                            }
+                        }
                     }
-                    Err(_) => break,
+
+                    if !stop_clone.load(Ordering::Relaxed) {
+                        for access_unit in drain_h264_access_units(&mut h264_buffer, true) {
+                            let _ = stream_publish_frame_tx.send(StreamPublishFrame {
+                                access_unit,
+                                timestamp_increment: 90_000 / STREAM_PUBLISH_TARGET_FPS,
+                            });
+                        }
+                    }
+
+                    Some(audio_thread)
                 }
-            }
+            };
 
             terminate_music_child(&mut child, libc::SIGTERM);
             let wait_result = child.wait();
+            if let Some(handle) = audio_thread.take() {
+                let _ = handle.join();
+            }
             if let Some(handle) = stderr_thread.take() {
                 let _ = handle.join();
             }
@@ -283,11 +564,30 @@ impl MusicPlayer {
         });
 
         MusicPlayer {
+            source,
             stop,
             paused,
             child_pid,
             thread: Some(thread),
         }
+    }
+
+    pub(crate) fn matches_visualizer_source(
+        &self,
+        url: &str,
+        resolved_direct_url: bool,
+        visualizer_mode: &VisualizerMode,
+    ) -> bool {
+        matches!(
+            &self.source,
+            MusicPlayerSource::Visualizer {
+                url: active_url,
+                resolved_direct_url: active_resolved_direct_url,
+                visualizer_mode: active_visualizer_mode,
+            } if active_url == url
+                && *active_resolved_direct_url == resolved_direct_url
+                && active_visualizer_mode == visualizer_mode
+        )
     }
 
     pub(crate) fn is_alive(&self) -> bool {
@@ -381,6 +681,7 @@ pub(crate) struct MusicState {
     pub(crate) finishing: bool,
     pub(crate) active_url: Option<String>,
     pub(crate) active_resolved_direct_url: bool,
+    pub(crate) active_visualizer_mode: Option<VisualizerMode>,
     pub(crate) pending_url: Option<String>,
     pub(crate) pending_received_at: Option<time::Instant>,
     pub(crate) pending_audio_seen: bool,
@@ -418,11 +719,17 @@ impl MusicState {
         self.finishing = false;
         self.active_url = None;
         self.active_resolved_direct_url = false;
+        self.active_visualizer_mode = None;
         self.pending_stop = false;
         self.clear_pending_start();
     }
 
-    pub(crate) fn queue_pending_start(&mut self, url: String, resolved_direct_url: bool) {
+    pub(crate) fn queue_pending_start(
+        &mut self,
+        url: String,
+        resolved_direct_url: bool,
+        visualizer_mode: Option<VisualizerMode>,
+    ) {
         self.stop_player();
         self.active = false;
         self.paused = false;
@@ -430,6 +737,7 @@ impl MusicState {
         self.pending_stop = false;
         self.active_url = Some(url.clone());
         self.active_resolved_direct_url = resolved_direct_url;
+        self.active_visualizer_mode = visualizer_mode;
         self.pending_url = Some(url);
         self.pending_received_at = Some(time::Instant::now());
         self.pending_audio_seen = false;

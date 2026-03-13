@@ -1,4 +1,5 @@
 use crate::ipc::InMsg;
+use crate::stream_publish::VisualizerMode;
 
 pub(crate) enum RoutedInMsg {
     Connection(ConnectionCommand),
@@ -74,6 +75,7 @@ pub(crate) enum PlaybackCommand {
     MusicPlay {
         url: String,
         resolved_direct_url: bool,
+        visualizer_mode: Option<VisualizerMode>,
     },
     MusicStop,
     MusicPause,
@@ -89,6 +91,11 @@ pub(crate) enum StreamPublishCommand {
     Play {
         url: String,
         resolved_direct_url: bool,
+    },
+    PlayVisualizer {
+        url: String,
+        resolved_direct_url: bool,
+        visualizer_mode: VisualizerMode,
     },
     BrowserStart {
         mime_type: String,
@@ -204,9 +211,13 @@ impl TryFrom<InMsg> for RoutedInMsg {
             InMsg::MusicPlay {
                 url,
                 resolved_direct_url,
+                visualizer_mode,
             } => Ok(Self::Playback(PlaybackCommand::MusicPlay {
                 url,
                 resolved_direct_url,
+                visualizer_mode: visualizer_mode
+                    .as_deref()
+                    .and_then(VisualizerMode::from_wire),
             })),
             InMsg::MusicStop => Ok(Self::Playback(PlaybackCommand::MusicStop)),
             InMsg::MusicPause => Ok(Self::Playback(PlaybackCommand::MusicPause)),
@@ -223,6 +234,16 @@ impl TryFrom<InMsg> for RoutedInMsg {
             } => Ok(Self::StreamPublish(StreamPublishCommand::Play {
                 url,
                 resolved_direct_url,
+            })),
+            InMsg::StreamPublishPlayVisualizer {
+                url,
+                resolved_direct_url,
+                visualizer_mode,
+            } => Ok(Self::StreamPublish(StreamPublishCommand::PlayVisualizer {
+                url,
+                resolved_direct_url,
+                visualizer_mode: VisualizerMode::from_wire(&visualizer_mode)
+                    .unwrap_or(VisualizerMode::Cqt),
             })),
             InMsg::StreamPublishBrowserStart { mime_type } => {
                 Ok(Self::StreamPublish(StreamPublishCommand::BrowserStart {

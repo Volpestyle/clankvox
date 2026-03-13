@@ -13,7 +13,9 @@ use crate::capture::{SpeakingState, UserCaptureState};
 use crate::dave::DaveManager;
 use crate::ipc::{ErrorCode, OutMsg, send_error, send_gateway_voice_state_update, send_msg};
 use crate::music::{MusicEvent, MusicState, drain_music_pcm_queue};
-use crate::stream_publish::{StreamPublishEvent, StreamPublishFrame, StreamPublishState};
+use crate::stream_publish::{
+    StreamPublishEvent, StreamPublishFrame, StreamPublishState, VisualizerMode,
+};
 use crate::video::{RemoteVideoState, UserVideoSubscription};
 use crate::voice_conn::{TransportRole, VoiceConnection, VoiceEvent};
 
@@ -189,12 +191,14 @@ impl AppState {
         url: &str,
         resolved_direct_url: bool,
         clear_output_buffers: bool,
+        visualizer_mode: Option<VisualizerMode>,
     ) {
         crate::music::start_music_pipeline(
             crate::music::MusicPipelineRequest {
                 url,
                 resolved_direct_url,
                 clear_output_buffers,
+                visualizer_mode,
             },
             crate::music::MusicPipelineContext {
                 music_player: &mut self.music.player,
@@ -202,6 +206,7 @@ impl AppState {
                 music_pcm_tx: &self.music_pcm_tx,
                 music_event_tx: &self.music_event_tx,
                 audio_send_state: &self.audio_send_state,
+                stream_publish_frame_tx: &self.stream_publish_frame_tx,
             },
         );
     }

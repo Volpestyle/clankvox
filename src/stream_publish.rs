@@ -14,9 +14,9 @@ use crate::voice_conn::TransportRole;
 
 const STREAM_PUBLISH_STDERR_TAIL_LINES: usize = 24;
 pub(crate) const STREAM_PUBLISH_TARGET_FPS: u32 = 30;
-const STREAM_PUBLISH_TARGET_WIDTH: u32 = 1280;
-const STREAM_PUBLISH_TARGET_HEIGHT: u32 = 720;
-const STREAM_PUBLISH_VIDEO_BITRATE_KBPS: u32 = 2_500;
+pub(crate) const STREAM_PUBLISH_TARGET_WIDTH: u32 = 1280;
+pub(crate) const STREAM_PUBLISH_TARGET_HEIGHT: u32 = 720;
+pub(crate) const STREAM_PUBLISH_VIDEO_BITRATE_KBPS: u32 = 2_500;
 const STREAM_PUBLISH_BROWSER_FRAME_MAX_BYTES: usize = 6 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
@@ -25,11 +25,45 @@ pub(crate) struct StreamPublishFrame {
     pub(crate) timestamp_increment: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VisualizerMode {
+    Cqt,
+    Spectrum,
+    Waves,
+    Vectorscope,
+}
+
+impl VisualizerMode {
+    pub(crate) fn from_wire(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "cqt" => Some(Self::Cqt),
+            "spectrum" => Some(Self::Spectrum),
+            "waves" => Some(Self::Waves),
+            "vectorscope" => Some(Self::Vectorscope),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::Cqt => "cqt",
+            Self::Spectrum => "spectrum",
+            Self::Waves => "waves",
+            Self::Vectorscope => "vectorscope",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StreamPublishSource {
     Url {
         url: String,
         resolved_direct_url: bool,
+    },
+    Visualizer {
+        url: String,
+        resolved_direct_url: bool,
+        visualizer_mode: VisualizerMode,
     },
     BrowserFrames {
         mime_type: String,
@@ -145,7 +179,7 @@ fn find_next_aud_start(data: &[u8], from: usize) -> Option<usize> {
     None
 }
 
-fn drain_h264_access_units(buffer: &mut Vec<u8>, flush_tail: bool) -> Vec<Vec<u8>> {
+pub(crate) fn drain_h264_access_units(buffer: &mut Vec<u8>, flush_tail: bool) -> Vec<Vec<u8>> {
     let Some(first_aud) = find_next_aud_start(buffer, 0) else {
         return Vec::new();
     };
@@ -186,6 +220,43 @@ pub(crate) fn build_stream_publish_pipeline_command(
     } else {
         format!(
             "yt-dlp --no-warnings --quiet --no-playlist --extractor-args 'youtube:player_client=android' -f \"bestvideo[ext=mp4][vcodec*=avc1]/bestvideo[vcodec*=avc1]/bestvideo/best\" -o - '{quoted_url}' | {}",
+            ffmpeg_tail.replace("{input}", "pipe:0")
+        )
+    }
+}
+
+pub(crate) fn build_visualizer_pipeline_command(
+    url: &str,
+    resolved_direct_url: bool,
+    visualizer_mode: VisualizerMode,
+) -> String {
+    let quoted_url = url.replace('\'', "'\\''");
+    let visualizer_filter = match visualizer_mode {
+        VisualizerMode::Spectrum => format!(
+            "showspectrum=s={STREAM_PUBLISH_TARGET_WIDTH}x{STREAM_PUBLISH_TARGET_HEIGHT}:slide=scroll:color=magma:scale=cbrt:fscale=log:orientation=vertical"
+        ),
+        VisualizerMode::Cqt => format!(
+            "showcqt=s={STREAM_PUBLISH_TARGET_WIDTH}x{STREAM_PUBLISH_TARGET_HEIGHT}:fps={STREAM_PUBLISH_TARGET_FPS}:sono_v=18:bar_v=12:axis=0"
+        ),
+        VisualizerMode::Waves => format!(
+            "showwaves=s={STREAM_PUBLISH_TARGET_WIDTH}x{STREAM_PUBLISH_TARGET_HEIGHT}:mode=cline:rate={STREAM_PUBLISH_TARGET_FPS}:scale=sqrt:colors=0x00ff88"
+        ),
+        VisualizerMode::Vectorscope => format!(
+            "aformat=channel_layouts=stereo,avectorscope=s={STREAM_PUBLISH_TARGET_HEIGHT}x{STREAM_PUBLISH_TARGET_HEIGHT}:mode=lissajous:draw=line:zoom=1.5:scale=sqrt:rate={STREAM_PUBLISH_TARGET_FPS},pad={STREAM_PUBLISH_TARGET_WIDTH}:{STREAM_PUBLISH_TARGET_HEIGHT}:(ow-iw)/2:0:black"
+        ),
+    };
+    let filter_complex =
+        format!("[0:a]asplit=2[viz][pass];[viz]{visualizer_filter},format=yuv420p[v]");
+    let ffmpeg_tail = format!(
+        "ffmpeg -nostdin -loglevel error -re -i {{input}} -filter_complex \"{filter_complex}\" -map \"[v]\" -an -sn -dn -c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -profile:v baseline -level 3.1 -g {STREAM_PUBLISH_TARGET_FPS} -keyint_min {STREAM_PUBLISH_TARGET_FPS} -sc_threshold 0 -b:v {STREAM_PUBLISH_VIDEO_BITRATE_KBPS}k -maxrate {STREAM_PUBLISH_VIDEO_BITRATE_KBPS}k -bufsize {}k -f h264 -bsf:v h264_metadata=aud=insert pipe:1 -map \"[pass]\" -f s16le -ar 48000 -ac 1 pipe:3",
+        STREAM_PUBLISH_VIDEO_BITRATE_KBPS * 2
+    );
+
+    if resolved_direct_url {
+        ffmpeg_tail.replace("{input}", &format!("'{quoted_url}'"))
+    } else {
+        format!(
+            "yt-dlp --no-warnings --quiet --no-playlist --extractor-args 'youtube:player_client=android' -f bestaudio/best -o - '{quoted_url}' | {}",
             ffmpeg_tail.replace("{input}", "pipe:0")
         )
     }
@@ -446,7 +517,8 @@ impl StreamPublishPlayer {
         let browser_mime_type = mime_type.clone();
 
         let thread = std::thread::spawn(move || {
-            let pipeline_command = build_stream_publish_browser_pipeline_command(&browser_mime_type);
+            let pipeline_command =
+                build_stream_publish_browser_pipeline_command(&browser_mime_type);
             let pipeline_started_at = tokio::time::Instant::now();
             let child = std::process::Command::new("sh")
                 .process_group(0)
@@ -788,24 +860,48 @@ impl AppState {
         self.stop_stream_publish_runtime("restart_before_publish_start");
         self.clear_stream_publish_runtime_buffers();
 
-        self.stream_publish.player = Some(match &source {
+        self.stream_publish.player = match &source {
             StreamPublishSource::Url {
                 url,
                 resolved_direct_url,
-            } => StreamPublishPlayer::start_url(
+            } => Some(StreamPublishPlayer::start_url(
                 url,
                 self.stream_publish_frame_tx.clone(),
                 self.stream_publish_event_tx.clone(),
                 *resolved_direct_url,
-            ),
+            )),
+            StreamPublishSource::Visualizer {
+                url,
+                resolved_direct_url,
+                visualizer_mode,
+            } => {
+                let visualizer_ready = self.music.player.as_ref().is_some_and(|player| {
+                    player.is_alive()
+                        && player.matches_visualizer_source(
+                            url,
+                            *resolved_direct_url,
+                            visualizer_mode,
+                        )
+                });
+                if !visualizer_ready {
+                    self.emit_transport_state(
+                        TransportRole::StreamPublish,
+                        "failed",
+                        Some("stream_publish_visualizer_source_unavailable"),
+                    );
+                    self.stream_publish.clear_pending_start();
+                    return;
+                }
+                None
+            }
             StreamPublishSource::BrowserFrames { mime_type } => {
-                StreamPublishPlayer::start_browser_frames(
+                Some(StreamPublishPlayer::start_browser_frames(
                     mime_type,
                     self.stream_publish_frame_tx.clone(),
                     self.stream_publish_event_tx.clone(),
-                )
+                ))
             }
-        });
+        };
         self.stream_publish.active = true;
         self.stream_publish.paused = false;
         self.stream_publish.active_source = Some(source.clone());
@@ -829,6 +925,18 @@ impl AppState {
                     url = %url,
                     resolved_direct_url,
                     "started stream publish pipeline"
+                );
+            }
+            StreamPublishSource::Visualizer {
+                url,
+                resolved_direct_url,
+                visualizer_mode,
+            } => {
+                info!(
+                    url = %url,
+                    resolved_direct_url,
+                    visualizer_mode = %visualizer_mode.as_str(),
+                    "attached stream publish to music visualizer pipeline"
                 );
             }
             StreamPublishSource::BrowserFrames { mime_type } => {
@@ -855,6 +963,46 @@ impl AppState {
                 let source = StreamPublishSource::Url {
                     url: normalized_url,
                     resolved_direct_url,
+                };
+                if self.stream_publish.active
+                    && !self.stream_publish.paused
+                    && self.stream_publish.active_source.as_ref() == Some(&source)
+                {
+                    self.emit_transport_state(TransportRole::StreamPublish, "playing", None);
+                    return;
+                }
+                if self.stream_publish.active_source.as_ref() != Some(&source) {
+                    self.stop_stream_publish_runtime("stream_publish_source_switch");
+                }
+                self.stream_publish.queue_pending_start(source);
+                if self.stream_publish_conn.is_some() {
+                    self.maybe_start_stream_publish_pipeline();
+                } else {
+                    self.emit_transport_state(
+                        TransportRole::StreamPublish,
+                        "waiting_for_transport",
+                        None,
+                    );
+                }
+            }
+            StreamPublishCommand::PlayVisualizer {
+                url,
+                resolved_direct_url,
+                visualizer_mode,
+            } => {
+                let normalized_url = url.trim().to_string();
+                if normalized_url.is_empty() {
+                    self.emit_transport_state(
+                        TransportRole::StreamPublish,
+                        "failed",
+                        Some("stream_publish_play_visualizer_missing_url"),
+                    );
+                    return;
+                }
+                let source = StreamPublishSource::Visualizer {
+                    url: normalized_url,
+                    resolved_direct_url,
+                    visualizer_mode,
                 };
                 if self.stream_publish.active
                     && !self.stream_publish.paused
@@ -976,7 +1124,9 @@ impl AppState {
                     self.emit_transport_state(
                         TransportRole::StreamPublish,
                         "failed",
-                        Some(&format!("stream_publish_browser_frame_write_failed: {error}")),
+                        Some(&format!(
+                            "stream_publish_browser_frame_write_failed: {error}"
+                        )),
                     );
                 }
             }
@@ -1049,12 +1199,12 @@ impl AppState {
     }
 
     pub(crate) async fn send_pending_stream_publish_frame(&mut self) {
-        if !self.stream_publish.active || self.stream_publish.paused {
-            return;
-        }
         let Ok(frame) = self.stream_publish_frame_rx.try_recv() else {
             return;
         };
+        if !self.stream_publish.active || self.stream_publish.paused {
+            return;
+        }
 
         let encrypted_frame = {
             let mut guard = self.stream_publish_dave.lock();
@@ -1083,8 +1233,9 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::{
-        STREAM_PUBLISH_TARGET_FPS, build_stream_publish_browser_pipeline_command,
-        build_stream_publish_pipeline_command, drain_h264_access_units,
+        STREAM_PUBLISH_TARGET_FPS, VisualizerMode, build_stream_publish_browser_pipeline_command,
+        build_stream_publish_pipeline_command, build_visualizer_pipeline_command,
+        drain_h264_access_units,
     };
 
     #[test]
@@ -1110,6 +1261,31 @@ mod tests {
         assert!(command.contains("-f image2pipe"));
         assert!(command.contains("-codec:v png"));
         assert!(command.contains("h264_metadata=aud=insert"));
+    }
+
+    #[test]
+    fn build_visualizer_pipeline_command_splits_audio_and_video_outputs() {
+        let command = build_visualizer_pipeline_command(
+            "https://cdn.example.com/audio.mp3",
+            true,
+            VisualizerMode::Cqt,
+        );
+        assert!(command.contains("asplit=2"));
+        assert!(command.contains("showcqt="));
+        assert!(command.contains("pipe:3"));
+        assert!(command.contains("h264_metadata=aud=insert"));
+    }
+
+    #[test]
+    fn build_visualizer_pipeline_command_uses_ytdlp_for_unresolved_sources() {
+        let command = build_visualizer_pipeline_command(
+            "https://soundcloud.com/example/track",
+            false,
+            VisualizerMode::Spectrum,
+        );
+        assert!(command.contains("yt-dlp"));
+        assert!(command.contains("showspectrum="));
+        assert!(command.contains("pipe:3"));
     }
 
     #[test]

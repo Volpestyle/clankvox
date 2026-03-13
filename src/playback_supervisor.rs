@@ -84,6 +84,7 @@ impl AppState {
             PlaybackCommand::MusicPlay {
                 url,
                 resolved_direct_url,
+                visualizer_mode,
             } => {
                 let normalized_url = url.trim().to_string();
                 if normalized_url.is_empty() {
@@ -94,13 +95,22 @@ impl AppState {
                 }
 
                 clear_music_send_buffer(&self.audio_send_state);
-                self.music
-                    .queue_pending_start(normalized_url.clone(), resolved_direct_url);
-                self.start_music_pipeline(&normalized_url, resolved_direct_url, false);
+                self.music.queue_pending_start(
+                    normalized_url.clone(),
+                    resolved_direct_url,
+                    visualizer_mode.clone(),
+                );
+                self.start_music_pipeline(
+                    &normalized_url,
+                    resolved_direct_url,
+                    false,
+                    visualizer_mode.clone(),
+                );
                 tracing::info!(
-                    "music_play queued pending start url={} direct={} (waiting for announcement drain)",
+                    "music_play queued pending start url={} direct={} visualizer={:?} (waiting for announcement drain)",
                     normalized_url,
-                    resolved_direct_url
+                    resolved_direct_url,
+                    visualizer_mode
                 );
                 false
             }
@@ -208,7 +218,12 @@ impl AppState {
                         "music_resume: player dead, restarting pipeline from url={}",
                         url
                     );
-                    self.start_music_pipeline(&url, self.music.active_resolved_direct_url, true);
+                    self.start_music_pipeline(
+                        &url,
+                        self.music.active_resolved_direct_url,
+                        true,
+                        self.music.active_visualizer_mode.clone(),
+                    );
                     self.music.paused = false;
                     self.music.active = true;
                     send_msg(&OutMsg::PlayerState {
@@ -255,6 +270,7 @@ impl AppState {
                 if !self.music.finishing {
                     self.music.active_url = None;
                     self.music.active_resolved_direct_url = false;
+                    self.music.active_visualizer_mode = None;
                     send_msg(&OutMsg::PlayerState {
                         status: "idle".into(),
                     });
@@ -378,12 +394,13 @@ impl AppState {
                 status: "playing".into(),
             });
             tracing::info!(
-                "music_play committed url={} reason={} totalWaitMs={} preparedLeadMs={} direct={}",
+                "music_play committed url={} reason={} totalWaitMs={} preparedLeadMs={} direct={} visualizer={:?}",
                 url,
                 reason,
                 total_wait_ms,
                 prepared_lead_ms,
-                committed_direct_url
+                committed_direct_url,
+                self.music.active_visualizer_mode
             );
         }
     }
@@ -484,6 +501,7 @@ impl AppState {
             self.music.paused = false;
             self.music.active_url = None;
             self.music.active_resolved_direct_url = false;
+            self.music.active_visualizer_mode = None;
             send_msg(&OutMsg::PlayerState {
                 status: "idle".into(),
             });
