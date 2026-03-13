@@ -31,6 +31,11 @@ pub(crate) enum StreamPublishSource {
         url: String,
         resolved_direct_url: bool,
     },
+    Visualizer {
+        url: String,
+        resolved_direct_url: bool,
+        visualizer_mode: String,
+    },
     BrowserFrames {
         mime_type: String,
     },
@@ -186,6 +191,42 @@ pub(crate) fn build_stream_publish_pipeline_command(
     } else {
         format!(
             "yt-dlp --no-warnings --quiet --no-playlist --extractor-args 'youtube:player_client=android' -f \"bestvideo[ext=mp4][vcodec*=avc1]/bestvideo[vcodec*=avc1]/bestvideo/best\" -o - '{quoted_url}' | {}",
+            ffmpeg_tail.replace("{input}", "pipe:0")
+        )
+    }
+}
+
+pub(crate) fn build_stream_publish_visualizer_pipeline_command(
+    url: &str,
+    resolved_direct_url: bool,
+    visualizer_mode: &str,
+) -> String {
+    let quoted_url = url.replace('\'', "'\\''");
+    let visualizer_filter = match visualizer_mode {
+        "spectrum" => format!(
+            "showspectrum=s={STREAM_PUBLISH_TARGET_WIDTH}x{STREAM_PUBLISH_TARGET_HEIGHT}:mode=combined:slide=scroll:color=intensity"
+        ),
+        "waves" => format!(
+            "showwaves=s={STREAM_PUBLISH_TARGET_WIDTH}x{STREAM_PUBLISH_TARGET_HEIGHT}:mode=cline:rate={STREAM_PUBLISH_TARGET_FPS}:colors=0x00FFAA|0x00AAFF"
+        ),
+        "vectorscope" => format!(
+            "avectorscope=s={STREAM_PUBLISH_TARGET_WIDTH}x{STREAM_PUBLISH_TARGET_HEIGHT}:mode=lissajous:rate={STREAM_PUBLISH_TARGET_FPS}:draw=line"
+        ),
+        // "cqt" and everything else
+        _ => format!(
+            "showcqt=s={STREAM_PUBLISH_TARGET_WIDTH}x{STREAM_PUBLISH_TARGET_HEIGHT}:fps={STREAM_PUBLISH_TARGET_FPS}:count=6:bar_g=6"
+        ),
+    };
+    let ffmpeg_tail = format!(
+        "ffmpeg -nostdin -loglevel error -re -i {{input}} -vn -filter_complex \"{visualizer_filter},format=yuv420p\" -c:v libx264 -preset veryfast -tune zerolatency -pix_fmt yuv420p -profile:v baseline -level 3.1 -g {STREAM_PUBLISH_TARGET_FPS} -keyint_min {STREAM_PUBLISH_TARGET_FPS} -sc_threshold 0 -b:v {STREAM_PUBLISH_VIDEO_BITRATE_KBPS}k -maxrate {STREAM_PUBLISH_VIDEO_BITRATE_KBPS}k -bufsize {}k -f h264 -bsf:v h264_metadata=aud=insert pipe:1",
+        STREAM_PUBLISH_VIDEO_BITRATE_KBPS * 2
+    );
+
+    if resolved_direct_url {
+        ffmpeg_tail.replace("{input}", &format!("'{quoted_url}'"))
+    } else {
+        format!(
+            "yt-dlp --no-warnings --quiet --no-playlist --extractor-args 'youtube:player_client=android' -f 'bestaudio/best' -o - '{quoted_url}' | {}",
             ffmpeg_tail.replace("{input}", "pipe:0")
         )
     }
@@ -409,6 +450,187 @@ impl StreamPublishPlayer {
                     Err(error) => {
                         let _ = event_tx.send(StreamPublishEvent::Error(format!(
                             "stream publish pipeline wait failed: {error}{stderr_summary}"
+                        )));
+                    }
+                }
+            }
+        });
+
+        Self {
+            stop,
+            paused,
+            child_pid,
+            thread: Some(thread),
+            mode: StreamPublishPlayerMode::Url,
+        }
+    }
+
+    pub(crate) fn start_visualizer(
+        url: &str,
+        frame_tx: crossbeam::Sender<StreamPublishFrame>,
+        event_tx: crossbeam::Sender<StreamPublishEvent>,
+        resolved_direct_url: bool,
+        visualizer_mode: &str,
+    ) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop.clone();
+        let paused = Arc::new(AtomicBool::new(false));
+        let paused_thread = paused.clone();
+        let child_pid = Arc::new(AtomicU32::new(0));
+        let child_pid_thread = child_pid.clone();
+        let url = url.to_string();
+        let visualizer_mode = visualizer_mode.to_string();
+
+        let thread = std::thread::spawn(move || {
+            let pipeline_command = build_stream_publish_visualizer_pipeline_command(
+                &url,
+                resolved_direct_url,
+                &visualizer_mode,
+            );
+            let pipeline_started_at = tokio::time::Instant::now();
+            let child = std::process::Command::new("sh")
+                .process_group(0)
+                .args(["-c", &pipeline_command])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn();
+
+            let mut child = match child {
+                Ok(child) => child,
+                Err(error) => {
+                    let _ = event_tx.send(StreamPublishEvent::Error(format!(
+                        "stream publish visualizer spawn failed: {error}"
+                    )));
+                    return;
+                }
+            };
+            child_pid_thread.store(child.id(), Ordering::SeqCst);
+
+            let stderr_tail = Arc::new(parking_lot::Mutex::new(VecDeque::<String>::new()));
+            let mut stderr_thread = child.stderr.take().map(|stderr| {
+                let stderr_tail = stderr_tail.clone();
+                std::thread::spawn(move || {
+                    let reader = io::BufReader::new(stderr);
+                    for line_result in reader.lines() {
+                        let line = match line_result {
+                            Ok(value) => value.trim().to_string(),
+                            Err(_) => break,
+                        };
+                        if line.is_empty() {
+                            continue;
+                        }
+                        let mut tail = stderr_tail.lock();
+                        if tail.len() >= STREAM_PUBLISH_STDERR_TAIL_LINES {
+                            tail.pop_front();
+                        }
+                        tail.push_back(line);
+                    }
+                })
+            });
+
+            let Some(mut stdout) = child.stdout.take() else {
+                let _ = event_tx.send(StreamPublishEvent::Error(
+                    "stream publish visualizer missing stdout".to_string(),
+                ));
+                terminate_stream_publish_child(&mut child, libc::SIGTERM);
+                let _ = child.wait();
+                if let Some(handle) = stderr_thread.take() {
+                    let _ = handle.join();
+                }
+                child_pid_thread.store(0, Ordering::SeqCst);
+                return;
+            };
+
+            let mut first_frame_reported = false;
+            let mut read_buffer = [0u8; 16 * 1024];
+            let mut h264_buffer = Vec::<u8>::with_capacity(256 * 1024);
+
+            loop {
+                if stop_clone.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                match stdout.read(&mut read_buffer) {
+                    Ok(0) => break,
+                    Ok(bytes_read) => {
+                        h264_buffer.extend_from_slice(&read_buffer[..bytes_read]);
+                        for access_unit in drain_h264_access_units(&mut h264_buffer, false) {
+                            if !first_frame_reported {
+                                first_frame_reported = true;
+                                let startup_ms = pipeline_started_at.elapsed().as_millis() as u64;
+                                info!(
+                                    startup_ms,
+                                    fps = STREAM_PUBLISH_TARGET_FPS,
+                                    visualizer_mode = %visualizer_mode,
+                                    "stream publish visualizer produced first video frame"
+                                );
+                                let _ = event_tx.send(StreamPublishEvent::FirstFrame {
+                                    startup_ms,
+                                    fps: STREAM_PUBLISH_TARGET_FPS,
+                                });
+                            }
+                            if frame_tx
+                                .send(StreamPublishFrame {
+                                    access_unit,
+                                    timestamp_increment: 90_000 / STREAM_PUBLISH_TARGET_FPS,
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let _ = event_tx.send(StreamPublishEvent::Error(format!(
+                            "stream publish visualizer stdout read failed: {error}"
+                        )));
+                        break;
+                    }
+                }
+            }
+
+            if !stop_clone.load(Ordering::Relaxed) {
+                for access_unit in drain_h264_access_units(&mut h264_buffer, true) {
+                    let _ = frame_tx.send(StreamPublishFrame {
+                        access_unit,
+                        timestamp_increment: 90_000 / STREAM_PUBLISH_TARGET_FPS,
+                    });
+                }
+            }
+
+            terminate_stream_publish_child(&mut child, libc::SIGTERM);
+            let wait_result = child.wait();
+            if let Some(handle) = stderr_thread.take() {
+                let _ = handle.join();
+            }
+            child_pid_thread.store(0, Ordering::SeqCst);
+            paused_thread.store(false, Ordering::SeqCst);
+
+            let stderr_summary = {
+                let tail = stderr_tail.lock();
+                if tail.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " | stderr tail: {}",
+                        tail.iter().cloned().collect::<Vec<_>>().join(" || ")
+                    )
+                }
+            };
+
+            if !stop_clone.load(Ordering::Relaxed) {
+                match wait_result {
+                    Ok(status) if status.success() => {
+                        let _ = event_tx.send(StreamPublishEvent::Idle);
+                    }
+                    Ok(status) => {
+                        let _ = event_tx.send(StreamPublishEvent::Error(format!(
+                            "stream publish visualizer exited with status {status}{stderr_summary}"
+                        )));
+                    }
+                    Err(error) => {
+                        let _ = event_tx.send(StreamPublishEvent::Error(format!(
+                            "stream publish visualizer wait failed: {error}{stderr_summary}"
                         )));
                     }
                 }
@@ -798,6 +1020,17 @@ impl AppState {
                 self.stream_publish_event_tx.clone(),
                 *resolved_direct_url,
             ),
+            StreamPublishSource::Visualizer {
+                url,
+                resolved_direct_url,
+                visualizer_mode,
+            } => StreamPublishPlayer::start_visualizer(
+                url,
+                self.stream_publish_frame_tx.clone(),
+                self.stream_publish_event_tx.clone(),
+                *resolved_direct_url,
+                visualizer_mode,
+            ),
             StreamPublishSource::BrowserFrames { mime_type } => {
                 StreamPublishPlayer::start_browser_frames(
                     mime_type,
@@ -831,6 +1064,18 @@ impl AppState {
                     "started stream publish pipeline"
                 );
             }
+            StreamPublishSource::Visualizer {
+                url,
+                resolved_direct_url,
+                visualizer_mode,
+            } => {
+                info!(
+                    url = %url,
+                    resolved_direct_url,
+                    visualizer_mode = %visualizer_mode,
+                    "started stream publish visualizer pipeline"
+                );
+            }
             StreamPublishSource::BrowserFrames { mime_type } => {
                 info!(mime_type = %mime_type, "started browser stream publish pipeline");
             }
@@ -855,6 +1100,53 @@ impl AppState {
                 let source = StreamPublishSource::Url {
                     url: normalized_url,
                     resolved_direct_url,
+                };
+                if self.stream_publish.active
+                    && !self.stream_publish.paused
+                    && self.stream_publish.active_source.as_ref() == Some(&source)
+                {
+                    self.emit_transport_state(TransportRole::StreamPublish, "playing", None);
+                    return;
+                }
+                if self.stream_publish.active_source.as_ref() != Some(&source) {
+                    self.stop_stream_publish_runtime("stream_publish_source_switch");
+                }
+                self.stream_publish.queue_pending_start(source);
+                if self.stream_publish_conn.is_some() {
+                    self.maybe_start_stream_publish_pipeline();
+                } else {
+                    self.emit_transport_state(
+                        TransportRole::StreamPublish,
+                        "waiting_for_transport",
+                        None,
+                    );
+                }
+            }
+            StreamPublishCommand::PlayVisualizer {
+                url,
+                resolved_direct_url,
+                visualizer_mode,
+            } => {
+                let normalized_url = url.trim().to_string();
+                if normalized_url.is_empty() {
+                    self.emit_transport_state(
+                        TransportRole::StreamPublish,
+                        "failed",
+                        Some("stream_publish_play_visualizer_missing_url"),
+                    );
+                    return;
+                }
+                let normalized_mode = match visualizer_mode.trim() {
+                    "spectrum" => "spectrum",
+                    "waves" => "waves",
+                    "vectorscope" => "vectorscope",
+                    _ => "cqt",
+                }
+                .to_string();
+                let source = StreamPublishSource::Visualizer {
+                    url: normalized_url,
+                    resolved_direct_url,
+                    visualizer_mode: normalized_mode,
                 };
                 if self.stream_publish.active
                     && !self.stream_publish.paused

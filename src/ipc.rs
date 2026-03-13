@@ -130,6 +130,13 @@ pub enum InMsg {
         #[serde(rename = "resolvedDirectUrl", default)]
         resolved_direct_url: bool,
     },
+    StreamPublishPlayVisualizer {
+        url: String,
+        #[serde(rename = "resolvedDirectUrl", default)]
+        resolved_direct_url: bool,
+        #[serde(rename = "visualizerMode", default = "default_visualizer_mode")]
+        visualizer_mode: String,
+    },
     StreamPublishBrowserStart {
         #[serde(rename = "mimeType")]
         mime_type: String,
@@ -162,6 +169,10 @@ pub fn default_video_max_frames_per_second() -> u32 {
 
 pub fn default_video_quality() -> u32 {
     100
+}
+
+pub fn default_visualizer_mode() -> String {
+    "cqt".to_string()
 }
 
 #[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]

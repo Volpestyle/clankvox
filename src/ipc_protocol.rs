@@ -90,6 +90,11 @@ pub(crate) enum StreamPublishCommand {
         url: String,
         resolved_direct_url: bool,
     },
+    PlayVisualizer {
+        url: String,
+        resolved_direct_url: bool,
+        visualizer_mode: String,
+    },
     BrowserStart {
         mime_type: String,
     },
@@ -223,6 +228,15 @@ impl TryFrom<InMsg> for RoutedInMsg {
             } => Ok(Self::StreamPublish(StreamPublishCommand::Play {
                 url,
                 resolved_direct_url,
+            })),
+            InMsg::StreamPublishPlayVisualizer {
+                url,
+                resolved_direct_url,
+                visualizer_mode,
+            } => Ok(Self::StreamPublish(StreamPublishCommand::PlayVisualizer {
+                url,
+                resolved_direct_url,
+                visualizer_mode,
             })),
             InMsg::StreamPublishBrowserStart { mime_type } => {
                 Ok(Self::StreamPublish(StreamPublishCommand::BrowserStart {
