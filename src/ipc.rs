@@ -114,7 +114,7 @@ pub enum InMsg {
     },
     MusicPlay {
         url: String,
-        #[serde(rename = "resolvedDirectUrl", default)]
+        #[serde(rename = "resolvedDirectUrl")]
         resolved_direct_url: bool,
         #[serde(rename = "visualizerMode")]
         visualizer_mode: Option<String>,
@@ -129,12 +129,12 @@ pub enum InMsg {
     },
     StreamPublishPlay {
         url: String,
-        #[serde(rename = "resolvedDirectUrl", default)]
+        #[serde(rename = "resolvedDirectUrl")]
         resolved_direct_url: bool,
     },
     StreamPublishPlayVisualizer {
         url: String,
-        #[serde(rename = "resolvedDirectUrl", default)]
+        #[serde(rename = "resolvedDirectUrl")]
         resolved_direct_url: bool,
         #[serde(rename = "visualizerMode")]
         visualizer_mode: String,
