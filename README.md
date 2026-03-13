@@ -1,6 +1,6 @@
 # clankvox
 
-`clankvox` is the Rust media-plane subprocess for Clanker Conk.
+`clankvox` is the Rust media-plane subprocess for Clanky
 
 It owns the Discord voice and Go Live transport work that Bun should not do itself:
 
