@@ -583,6 +583,46 @@ impl AppState {
             }
             VoiceEvent::DaveReady { role } => {
                 tracing::info!(role = role.as_str(), "DAVE E2EE session is ready");
+                // For stream watch: the initial keyframe burst from Discord
+                // often arrives before the DAVE session is ready, so those
+                // frames fail decrypt and are lost.  Immediately request a
+                // fresh keyframe now that we can actually decrypt.
+                if role == TransportRole::StreamWatch || role == TransportRole::Voice {
+                    if let Some(conn) = self.video_conn() {
+                        for remote_state in self.remote_video_states.values() {
+                            for stream in &remote_state.streams {
+                                tracing::info!(
+                                    role = role.as_str(),
+                                    ssrc = stream.ssrc,
+                                    "clankvox_dave_ready_pli_requesting_keyframe"
+                                );
+                                if let Err(error) = conn.send_rtcp_pli(stream.ssrc) {
+                                    tracing::warn!(
+                                        ssrc = stream.ssrc,
+                                        error = %error,
+                                        "clankvox_dave_ready_pli_failed"
+                                    );
+                                }
+                            }
+                            if let Some(video_ssrc) = remote_state.video_ssrc {
+                                if !remote_state.streams.iter().any(|s| s.ssrc == video_ssrc) {
+                                    tracing::info!(
+                                        role = role.as_str(),
+                                        ssrc = video_ssrc,
+                                        "clankvox_dave_ready_pli_requesting_keyframe"
+                                    );
+                                    if let Err(error) = conn.send_rtcp_pli(video_ssrc) {
+                                        tracing::warn!(
+                                            ssrc = video_ssrc,
+                                            error = %error,
+                                            "clankvox_dave_ready_pli_failed"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
             VoiceEvent::Disconnected { role, reason } => match role {
                 TransportRole::Voice => self.handle_disconnected(&reason),

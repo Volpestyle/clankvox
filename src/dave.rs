@@ -40,6 +40,8 @@ pub struct DaveManager {
     pending_downgrade_since: Option<Instant>,
     /// Counter for unencrypted passthrough frames, used to rate-limit warnings.
     unencrypted_passthrough_count: u32,
+    /// Total decrypt failures (not reset on success), used to rate-limit warnings.
+    total_decrypt_failures: u32,
 }
 
 /// Serialized commit+welcome ready to send as OP28 binary.
@@ -83,6 +85,7 @@ impl DaveManager {
                 reinitializing: false,
                 pending_downgrade_since: None,
                 unencrypted_passthrough_count: 0,
+                total_decrypt_failures: 0,
             },
             pkg,
         ))
@@ -228,13 +231,15 @@ impl DaveManager {
             }
             Err(DecryptError::NoDecryptorForUser) => {
                 self.consecutive_failures += 1;
-                if self.consecutive_failures <= 3 || self.consecutive_failures % 50 == 0 {
+                self.total_decrypt_failures += 1;
+                if self.total_decrypt_failures <= 3 || self.total_decrypt_failures % 100 == 0 {
                     warn!(
                         "DAVE: decrypt_{label} NoDecryptorForUser: user_id={sender_user_id}, \
-                         known_users={:?}, pv={}, frame_bytes={}",
+                         known_users={:?}, pv={}, frame_bytes={}, total={}",
                         self.known_user_ids(),
                         self.protocol_version,
                         frame.len(),
+                        self.total_decrypt_failures,
                     );
                 }
                 Err(anyhow::anyhow!(
@@ -243,13 +248,15 @@ impl DaveManager {
             }
             Err(DecryptError::DecryptionFailed(ref inner)) => {
                 self.consecutive_failures += 1;
-                if self.consecutive_failures <= 5 || self.consecutive_failures % 50 == 0 {
+                self.total_decrypt_failures += 1;
+                if self.total_decrypt_failures <= 3 || self.total_decrypt_failures % 100 == 0 {
                     warn!(
                         "DAVE: decrypt_{label} failed: user_id={sender_user_id}, \
-                         error={inner}, pv={}, frame_bytes={}, consecutive_failures={}",
+                         error={inner}, pv={}, frame_bytes={}, consecutive={}, total={}",
                         self.protocol_version,
                         frame.len(),
                         self.consecutive_failures,
+                        self.total_decrypt_failures,
                     );
                 }
                 Err(anyhow::anyhow!("decrypt_{label}: {e:?}", e = inner))
