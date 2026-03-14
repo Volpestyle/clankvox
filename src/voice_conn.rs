@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
@@ -230,11 +230,14 @@ enum WsCommand {
 // ---------------------------------------------------------------------------
 
 const RTP_HEADER_LEN: usize = 12;
+const RTCP_HEADER_LEN: usize = 4;
 const OPUS_PT: u8 = 0x78; // payload type 120
 const H264_PT: u8 = 103;
 const H264_RTX_PT: u8 = 104;
 const VP8_PT: u8 = 105;
 const VP8_RTX_PT: u8 = 106;
+const TRANSPORT_TAG_LEN: usize = 16;
+const TRANSPORT_NONCE_LEN: usize = 4;
 const MAX_VIDEO_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const VIDEO_RTP_EXTENSION_HEADER: [u8; 4] = [0xbe, 0xde, 0x00, 0x01];
 const VIDEO_RTP_EXTENSION_PAYLOAD: [u8; 4] = [0x51, 0x00, 0x00, 0x00];
@@ -282,6 +285,22 @@ fn build_video_rtp_header(
     h[4..8].copy_from_slice(&timestamp.to_be_bytes());
     h[8..12].copy_from_slice(&ssrc.to_be_bytes());
     h
+}
+
+fn build_rtcp_header(
+    fmt_or_count: u8,
+    packet_type: u8,
+    packet_len_bytes: usize,
+) -> [u8; RTCP_HEADER_LEN] {
+    let mut header = [0u8; RTCP_HEADER_LEN];
+    let word_count = packet_len_bytes / 4;
+    let length_field = word_count
+        .checked_sub(1)
+        .expect("rtcp packet length must include at least one 32-bit word");
+    header[0] = 0x80 | (fmt_or_count & 0x1f); // V=2, P=0
+    header[1] = packet_type;
+    header[2..4].copy_from_slice(&(length_field as u16).to_be_bytes());
+    header
 }
 
 fn parse_rtp_header(data: &[u8]) -> Option<(u16, u32, u32, usize, bool)> {
@@ -385,6 +404,17 @@ impl VideoDepacketizers {
         }
         state.push(ssrc, sequence, timestamp, marker, payload)
     }
+
+    /// Prepend cached SPS+PPS from the depacketizer to a frame.
+    /// Called AFTER DAVE decrypt so the DAVE trailer's unencrypted ranges
+    /// reference the correct byte offsets in the original frame.
+    fn prepend_cached_h264_params(&self, ssrc: u32, frame: Vec<u8>) -> Vec<u8> {
+        if let Some(state) = self.by_ssrc.get(&ssrc) {
+            state.h264.prepend_cached_parameter_sets(frame)
+        } else {
+            frame
+        }
+    }
 }
 
 struct VideoDepacketizerState {
@@ -446,6 +476,10 @@ struct H264Depacketizer {
     buffer: Vec<u8>,
     keyframe: bool,
     in_fu: bool,
+    /// Cached SPS NAL unit (without start code) from the most recent SPS seen.
+    cached_sps: Option<Vec<u8>>,
+    /// Cached PPS NAL unit (without start code) from the most recent PPS seen.
+    cached_pps: Option<Vec<u8>>,
 }
 
 impl H264Depacketizer {
@@ -457,9 +491,10 @@ impl H264Depacketizer {
         let nal_type = payload[0] & 0x1F;
         match nal_type {
             1..=23 => {
+                self.cache_parameter_set(nal_type, payload);
                 self.append_start_code();
                 self.extend(payload)?;
-                if matches!(nal_type, 5 | 7) {
+                if nal_type == 5 {
                     self.keyframe = true;
                 }
                 self.in_fu = false;
@@ -477,7 +512,8 @@ impl H264Depacketizer {
                     let nalu = &payload[cursor..cursor + nalu_len];
                     if !nalu.is_empty() {
                         let stap_nal_type = nalu[0] & 0x1F;
-                        if matches!(stap_nal_type, 5 | 7) {
+                        self.cache_parameter_set(stap_nal_type, nalu);
+                        if stap_nal_type == 5 {
                             self.keyframe = true;
                         }
                         self.append_start_code();
@@ -500,7 +536,7 @@ impl H264Depacketizer {
                     self.extend(&[reconstructed_header])?;
                     self.extend(&payload[2..])?;
                     self.in_fu = true;
-                    if matches!(nal_type, 5 | 7) {
+                    if nal_type == 5 {
                         self.keyframe = true;
                     }
                 } else {
@@ -519,8 +555,13 @@ impl H264Depacketizer {
         }
 
         if marker && !self.buffer.is_empty() {
-            let keyframe = self.keyframe || h264_annexb_is_keyframe(&self.buffer);
+            let keyframe = self.keyframe || h264_annexb_has_idr_slice(&self.buffer);
             let frame = std::mem::take(&mut self.buffer);
+            // NOTE: Do NOT prepend cached SPS+PPS here.  The depacketized
+            // frame goes to DAVE decrypt first, and prepending would shift
+            // the byte offsets that the DAVE trailer's unencrypted ranges
+            // reference, causing decrypt to fail.  SPS+PPS prepend happens
+            // AFTER DAVE decrypt in the UDP recv loop.
             self.timestamp = None;
             self.keyframe = false;
             self.in_fu = false;
@@ -528,6 +569,82 @@ impl H264Depacketizer {
         }
 
         None
+    }
+
+    /// Cache SPS (NAL type 7) and PPS (NAL type 8) NAL units so they can be
+    /// prepended to keyframes that arrive without inline parameter sets.
+    fn cache_parameter_set(&mut self, nal_type: u8, nalu: &[u8]) {
+        match nal_type {
+            7 => {
+                self.cached_sps = Some(nalu.to_vec());
+            }
+            8 => {
+                self.cached_pps = Some(nalu.to_vec());
+            }
+            _ => {}
+        }
+    }
+
+    /// If the assembled frame is a keyframe but doesn't contain SPS/PPS inline,
+    /// prepend the cached parameter sets so ffmpeg can decode it standalone.
+    fn prepend_cached_parameter_sets(&self, frame: Vec<u8>) -> Vec<u8> {
+        let has_sps = Self::annexb_contains_nal_type(&frame, 7);
+        let has_pps = Self::annexb_contains_nal_type(&frame, 8);
+        if has_sps && has_pps {
+            return frame;
+        }
+
+        let sps = if !has_sps {
+            self.cached_sps.as_deref()
+        } else {
+            None
+        };
+        let pps = if !has_pps {
+            self.cached_pps.as_deref()
+        } else {
+            None
+        };
+        if sps.is_none() && pps.is_none() {
+            return frame;
+        }
+
+        let start_code: &[u8] = &[0, 0, 0, 1];
+        let extra_len = sps.map_or(0, |s| 4 + s.len()) + pps.map_or(0, |p| 4 + p.len());
+        let mut out = Vec::with_capacity(extra_len + frame.len());
+        if let Some(s) = sps {
+            out.extend_from_slice(start_code);
+            out.extend_from_slice(s);
+        }
+        if let Some(p) = pps {
+            out.extend_from_slice(start_code);
+            out.extend_from_slice(p);
+        }
+        out.extend_from_slice(&frame);
+        out
+    }
+
+    /// Scan an Annex-B bitstream for the presence of a specific NAL type.
+    fn annexb_contains_nal_type(buf: &[u8], target: u8) -> bool {
+        let mut i = 0;
+        while i < buf.len().saturating_sub(3) {
+            if buf[i] == 0 && buf[i + 1] == 0 {
+                let nal_start = if buf[i + 2] == 1 {
+                    i + 3
+                } else if buf[i + 2] == 0 && i + 3 < buf.len() && buf[i + 3] == 1 {
+                    i + 4
+                } else {
+                    i += 1;
+                    continue;
+                };
+                if nal_start < buf.len() && (buf[nal_start] & 0x1F) == target {
+                    return true;
+                }
+                i = nal_start;
+            } else {
+                i += 1;
+            }
+        }
+        false
     }
 
     fn prepare_timestamp(&mut self, timestamp: u32) {
@@ -672,14 +789,14 @@ fn find_next_start_code(data: &[u8], from: usize) -> Option<(usize, usize)> {
     None
 }
 
-fn h264_annexb_is_keyframe(frame: &[u8]) -> bool {
+fn h264_annexb_has_idr_slice(frame: &[u8]) -> bool {
     let mut index = 0usize;
     while index + 4 <= frame.len() {
         if frame[index..].starts_with(&[0, 0, 0, 1]) {
             let nal_start = index + 4;
             if let Some(byte) = frame.get(nal_start) {
                 let nal_type = byte & 0x1F;
-                if matches!(nal_type, 5 | 7) {
+                if nal_type == 5 {
                     return true;
                 }
             }
@@ -688,7 +805,7 @@ fn h264_annexb_is_keyframe(frame: &[u8]) -> bool {
             let nal_start = index + 3;
             if let Some(byte) = frame.get(nal_start) {
                 let nal_type = byte & 0x1F;
-                if matches!(nal_type, 5 | 7) {
+                if nal_type == 5 {
                     return true;
                 }
             }
@@ -698,6 +815,27 @@ fn h264_annexb_is_keyframe(frame: &[u8]) -> bool {
         }
     }
     false
+}
+
+fn collect_annexb_nal_types(frame: &[u8]) -> Vec<u8> {
+    let mut types = Vec::new();
+    let mut index = 0usize;
+    while index + 4 <= frame.len() {
+        if frame[index..].starts_with(&[0, 0, 0, 1]) {
+            if let Some(byte) = frame.get(index + 4) {
+                types.push(byte & 0x1F);
+            }
+            index += 4;
+        } else if frame[index..].starts_with(&[0, 0, 1]) {
+            if let Some(byte) = frame.get(index + 3) {
+                types.push(byte & 0x1F);
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    types
 }
 
 fn split_h264_annexb_nalus(frame: &[u8]) -> Vec<&[u8]> {
@@ -1000,13 +1138,14 @@ fn build_select_protocol_payload(
 }
 
 fn build_media_sink_wants_payload(wants: &[(u32, u8)], pixel_counts: &[(u32, f64)]) -> Value {
+    let any_quality = wants.iter().map(|(_, q)| *q).max().unwrap_or(100);
     let streams = wants
         .iter()
         .fold(serde_json::Map::new(), |mut acc, (ssrc, quality)| {
             acc.insert(ssrc.to_string(), json!(quality));
             acc
         });
-    let pixel_counts =
+    let pixel_counts_map =
         pixel_counts
             .iter()
             .fold(serde_json::Map::new(), |mut acc, (ssrc, pixel_count)| {
@@ -1016,8 +1155,9 @@ fn build_media_sink_wants_payload(wants: &[(u32, u8)], pixel_counts: &[(u32, f64
     json!({
         "op": 15,
         "d": {
+            "any": any_quality,
             "streams": streams,
-            "pixelCounts": pixel_counts,
+            "pixelCounts": pixel_counts_map,
         }
     })
 }
@@ -1089,35 +1229,23 @@ impl TransportCrypto {
         })
     }
 
-    /// Encrypt an Opus payload for sending.
+    /// Encrypt a transport payload for sending under Discord's `rtpsize` modes.
     /// Returns `[ciphertext + 16-byte tag + 4-byte BE nonce]`.
-    fn encrypt(&self, rtp_header: &[u8], payload: &[u8]) -> Result<Vec<u8>> {
+    fn encrypt(&self, aad: &[u8], payload: &[u8]) -> Result<Vec<u8>> {
         let nonce_val = self.send_nonce.fetch_add(1, Ordering::SeqCst);
         let ct = match &self.cipher {
             TransportCipher::Aes256GcmRtpSize(cipher) => {
                 let mut nonce_12 = [0u8; 12];
                 nonce_12[0..4].copy_from_slice(&nonce_val.to_be_bytes());
                 cipher
-                    .encrypt(
-                        Nonce::from_slice(&nonce_12),
-                        Payload {
-                            msg: payload,
-                            aad: rtp_header,
-                        },
-                    )
+                    .encrypt(Nonce::from_slice(&nonce_12), Payload { msg: payload, aad })
                     .map_err(|e| anyhow::anyhow!("AES-GCM encrypt: {e}"))?
             }
             TransportCipher::XChaCha20Poly1305RtpSize(cipher) => {
                 let mut nonce_24 = [0u8; 24];
                 nonce_24[0..4].copy_from_slice(&nonce_val.to_be_bytes());
                 cipher
-                    .encrypt(
-                        XNonce::from_slice(&nonce_24),
-                        Payload {
-                            msg: payload,
-                            aad: rtp_header,
-                        },
-                    )
+                    .encrypt(XNonce::from_slice(&nonce_24), Payload { msg: payload, aad })
                     .map_err(|e| anyhow::anyhow!("XChaCha20-Poly1305 encrypt: {e}"))?
             }
         };
@@ -1127,26 +1255,32 @@ impl TransportCrypto {
         Ok(out)
     }
 
-    /// Decrypt a received RTP payload.
-    /// `packet` is the full UDP datagram, `header_size` is the RTP header length.
+    /// Decrypt a received RTP media packet.
+    ///
+    /// Under Discord's `rtpsize` AEAD modes the AAD covers the RTP fixed
+    /// header + CSRC list + the 4-byte extension header prefix (profile +
+    /// length) but **not** the extension body.  `header_size` from
+    /// `parse_rtp_header` includes the full extension (header + body), so we
+    /// must recompute the AAD boundary from the raw packet bytes.
     fn decrypt(&self, packet: &[u8], _header_size: usize) -> Result<Vec<u8>> {
-        // Layout: [rtp_header_for_aad | ciphertext + 16-byte tag | 4-byte BE nonce]
-        if packet.len() < 16 + 4 + 16 {
-            bail!("Packet too small for transport decryption");
-        }
-
-        // In "aead_aes256_gcm_rtpsize", the AAD is:
-        // RTP fixed header + CSRC list, plus 4 bytes of extension header if X is set.
         let cc = (packet[0] & 0x0F) as usize;
         let mut aad_size = RTP_HEADER_LEN + cc * 4;
         if (packet[0] >> 4) & 0x01 != 0 {
             aad_size += 4;
         }
+        self.decrypt_with_aad(packet, aad_size)
+    }
+
+    fn decrypt_with_aad(&self, packet: &[u8], aad_size: usize) -> Result<Vec<u8>> {
+        // Layout: [aad | ciphertext + 16-byte tag | 4-byte BE nonce]
+        if packet.len() < aad_size + TRANSPORT_TAG_LEN + TRANSPORT_NONCE_LEN {
+            bail!("Packet too small for transport decryption");
+        }
         if packet.len() <= aad_size + 4 {
             bail!("Packet too small for computed AAD size {aad_size}");
         }
 
-        let rtp_header = &packet[..aad_size];
+        let aad = &packet[..aad_size];
         let nonce_start = packet.len() - 4;
         let nonce_raw = &packet[nonce_start..];
         let ct_with_tag = &packet[aad_size..nonce_start];
@@ -1161,7 +1295,7 @@ impl TransportCrypto {
                         Nonce::from_slice(&nonce_12),
                         Payload {
                             msg: ct_with_tag,
-                            aad: rtp_header,
+                            aad,
                         },
                     )
                     .map_err(|e| anyhow::anyhow!("AES-GCM decrypt: {e}"))
@@ -1175,12 +1309,27 @@ impl TransportCrypto {
                         XNonce::from_slice(&nonce_24),
                         Payload {
                             msg: ct_with_tag,
-                            aad: rtp_header,
+                            aad,
                         },
                     )
                     .map_err(|e| anyhow::anyhow!("XChaCha20-Poly1305 decrypt: {e}"))
             }
         }
+    }
+
+    fn build_protected_rtcp_packet(
+        &self,
+        fmt_or_count: u8,
+        packet_type: u8,
+        body: &[u8],
+    ) -> Result<Vec<u8>> {
+        let packet_len = RTCP_HEADER_LEN + body.len() + TRANSPORT_TAG_LEN + TRANSPORT_NONCE_LEN;
+        let header = build_rtcp_header(fmt_or_count, packet_type, packet_len);
+        let encrypted = self.encrypt(&header, body)?;
+        let mut packet = Vec::with_capacity(header.len() + encrypted.len());
+        packet.extend_from_slice(&header);
+        packet.extend_from_slice(&encrypted);
+        Ok(packet)
     }
 }
 
@@ -1235,6 +1384,7 @@ pub struct VoiceConnection {
     video_streams: Vec<VideoStreamDescriptor>,
     video_sequence: AtomicU32,
     video_timestamp: AtomicU32,
+    fir_sequence: AtomicU32,
     ws_cmd_tx: mpsc::Sender<WsCommand>,
     ws_read_task: JoinHandle<()>,
     ws_write_task: JoinHandle<()>,
@@ -1626,6 +1776,7 @@ impl VoiceConnection {
             },
             video_sequence: AtomicU32::new(0),
             video_timestamp: AtomicU32::new(0),
+            fir_sequence: AtomicU32::new(0),
             ws_cmd_tx,
             ws_read_task,
             ws_write_task,
@@ -1794,6 +1945,61 @@ impl VoiceConnection {
         self.ws_cmd_tx
             .try_send(WsCommand::SendJson(payload))
             .map_err(|error| anyhow::anyhow!("failed to enqueue media sink wants: {error}"))
+    }
+
+    fn send_protected_rtcp_packet(
+        &self,
+        fmt_or_count: u8,
+        packet_type: u8,
+        body: &[u8],
+        packet_label: &'static str,
+    ) -> Result<usize> {
+        let packet = self
+            .crypto
+            .build_protected_rtcp_packet(fmt_or_count, packet_type, body)
+            .with_context(|| format!("RTCP {packet_label} transport encrypt"))?;
+        self.udp_socket
+            .try_send(&packet)
+            .with_context(|| format!("RTCP {packet_label} send"))?;
+        Ok(packet.len())
+    }
+
+    /// Send protected RTCP feedback packets containing:
+    ///   1. RR (Receiver Report)
+    ///   2. PLI (Picture Loss Indication, RFC 4585)
+    ///   3. FIR (Full Intra Request, RFC 5104)
+    ///
+    /// Under Discord's `rtpsize` modes, feedback rides the same transport
+    /// protection as media. Each RTCP packet is protected independently so its
+    /// header length still matches the on-wire packet bytes.
+    pub fn send_rtcp_pli(&self, media_ssrc: u32) -> Result<()> {
+        let fir_seq = self.fir_sequence.fetch_add(1, Ordering::Relaxed) as u8;
+
+        let rr_body = self.ssrc.to_be_bytes();
+
+        let mut pli_body = [0u8; 8];
+        pli_body[0..4].copy_from_slice(&self.ssrc.to_be_bytes());
+        pli_body[4..8].copy_from_slice(&media_ssrc.to_be_bytes());
+
+        let mut fir_body = [0u8; 16];
+        fir_body[0..4].copy_from_slice(&self.ssrc.to_be_bytes());
+        fir_body[4..8].copy_from_slice(&0u32.to_be_bytes()); // media source = 0 for FIR
+        fir_body[8..12].copy_from_slice(&media_ssrc.to_be_bytes());
+        fir_body[12] = fir_seq;
+
+        let rr_packet_len = self.send_protected_rtcp_packet(0, 201, &rr_body, "rr")?;
+        let pli_packet_len = self.send_protected_rtcp_packet(1, 206, &pli_body, "pli")?;
+        let fir_packet_len = self.send_protected_rtcp_packet(4, 206, &fir_body, "fir")?;
+        info!(
+            sender_ssrc = self.ssrc,
+            media_ssrc,
+            fir_seq,
+            rr_packet_len,
+            pli_packet_len,
+            fir_packet_len,
+            "clankvox_rtcp_pli_sent"
+        );
+        Ok(())
     }
 
     pub fn shutdown(&self) {
@@ -2597,6 +2803,60 @@ struct VideoFrameDecryptOutcome {
     needs_recovery: bool,
 }
 
+fn ordered_audio_candidate_user_ids(
+    current_user_id: Option<u64>,
+    bot_user_id: u64,
+    known_user_ids: &[u64],
+) -> Vec<u64> {
+    let mut ordered = Vec::new();
+    if let Some(current_user_id) = current_user_id {
+        if current_user_id != bot_user_id {
+            ordered.push(current_user_id);
+        }
+    }
+
+    for &candidate_user_id in known_user_ids {
+        if candidate_user_id == bot_user_id
+            || Some(candidate_user_id) == current_user_id
+            || ordered.contains(&candidate_user_id)
+        {
+            continue;
+        }
+        ordered.push(candidate_user_id);
+    }
+
+    ordered
+}
+
+fn try_decrypt_audio_payload_for_user(
+    dm: &mut DaveManager,
+    user_id: u64,
+    primary_payload: &[u8],
+    fallback_payload: Option<&[u8]>,
+    ssrc: u32,
+) -> Option<(Vec<u8>, bool)> {
+    let can_decrypt = dm.is_ready() && (dm.protocol_version() != 0 || dm.can_passthrough(user_id));
+    if !can_decrypt {
+        return None;
+    }
+
+    if let Ok(decrypted) = dm.decrypt(user_id, primary_payload) {
+        return Some((decrypted, false));
+    }
+
+    if let Some(fallback_payload) = fallback_payload {
+        if let Ok(decrypted) = dm.decrypt(user_id, fallback_payload) {
+            debug!(
+                user_id,
+                ssrc, "UDP: DAVE audio decrypt recovered using alternate RTP ext handling"
+            );
+            return Some((decrypted, true));
+        }
+    }
+
+    None
+}
+
 fn try_decrypt_video_candidate_for_user(
     dm: &mut DaveManager,
     user_id: u64,
@@ -2842,6 +3102,9 @@ async fn udp_recv_loop(
     let mut buf = [0u8; 65_536];
     let mut video_depacketizers = VideoDepacketizers::default();
     let mut fallback_video_depacketizers = VideoDepacketizers::default();
+    let mut observed_transport_decrypt_failures = HashSet::<u8>::new();
+    let mut video_frame_emit_count: u64 = 0;
+    let mut video_keyframe_count: u64 = 0;
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -2872,6 +3135,17 @@ async fn udp_recv_loop(
         };
 
         let payload_type = packet[1] & 0x7F;
+
+        // RTCP packets (SR=200, RR=201, SDES=202, BYE=203, APP=204) share
+        // the UDP socket via RTP/RTCP mux (RFC 5761).  Their payload-type
+        // byte (masked to 7 bits) falls in 72-76.  We don't process inbound
+        // RTCP — just skip before attempting RTP transport decryption, which
+        // would fail because RTCP has a different AAD layout.
+        if (72..=76).contains(&payload_type) {
+            trace!(payload_type, ssrc, "UDP skip: inbound RTCP packet");
+            continue;
+        }
+
         if VideoCodecKind::is_rtx_payload_type(payload_type) {
             trace!(
                 payload_type,
@@ -2883,6 +3157,18 @@ async fn udp_recv_loop(
         let decrypted = match crypto.decrypt(packet, header_size) {
             Ok(p) => p,
             Err(e) => {
+                if (payload_type == OPUS_PT
+                    || VideoCodecKind::from_payload_type(payload_type).is_some())
+                    && observed_transport_decrypt_failures.insert(payload_type)
+                {
+                    info!(
+                        role = role.as_str(),
+                        payload_type,
+                        header_size,
+                        error = %e,
+                        "clankvox_transport_decrypt_failed"
+                    );
+                }
                 debug!("UDP drop: Transport crypto decrypt failed: {e}");
                 continue;
             }
@@ -2899,79 +3185,64 @@ async fn udp_recv_loop(
             let user_id = ssrc_map.lock().get(&ssrc).copied();
             let fallback_payload = fallback_payload.as_deref();
 
-            let (opus_frame_opt, needs_recovery) = {
+            let (opus_frame_opt, remapped_user_id, needs_recovery) = {
                 let mut guard = dave.lock();
-                match (&mut *guard, user_id) {
-                    (Some(dm), Some(uid)) => {
+                match &mut *guard {
+                    Some(dm) => {
                         dm.maybe_auto_execute_downgrade();
 
-                        let can_decrypt = dm.is_ready()
-                            && (dm.protocol_version() != 0 || dm.can_passthrough(uid));
-                        if can_decrypt {
-                            match dm.decrypt(uid, &primary_payload) {
-                                Ok(decrypted) => (Some(decrypted), false),
-                                Err(e) => {
-                                    let mut recovered: Option<Vec<u8>> = None;
+                        if !dm.is_ready() {
+                            (Some(primary_payload.clone()), None, false)
+                        } else {
+                            let candidate_user_ids = ordered_audio_candidate_user_ids(
+                                user_id,
+                                dm.user_id(),
+                                &dm.known_user_ids(),
+                            );
+                            let mut recovered: Option<(Vec<u8>, u64)> = None;
 
-                                    if let Some(alt_payload) = fallback_payload {
-                                        if let Ok(decrypted) = dm.decrypt(uid, alt_payload) {
-                                            debug!(
-                                                "UDP: DAVE audio decrypt recovered for {} using alternate RTP ext handling",
-                                                uid
-                                            );
-                                            recovered = Some(decrypted);
-                                        }
-                                    }
-
-                                    if recovered.is_none() {
-                                        for candidate_uid in dm.known_user_ids() {
-                                            if candidate_uid == uid || candidate_uid == dm.user_id()
-                                            {
-                                                continue;
-                                            }
-                                            if let Ok(decrypted) =
-                                                dm.decrypt(candidate_uid, &primary_payload)
-                                            {
-                                                ssrc_map.lock().insert(ssrc, candidate_uid);
-                                                debug!(
-                                                    "UDP: remapped audio ssrc {} from user {} to {} after successful DAVE decrypt",
-                                                    ssrc, uid, candidate_uid
-                                                );
-                                                recovered = Some(decrypted);
-                                                break;
-                                            }
-                                            if let Some(alt_payload) = fallback_payload {
-                                                if let Ok(decrypted) =
-                                                    dm.decrypt(candidate_uid, alt_payload)
-                                                {
-                                                    ssrc_map.lock().insert(ssrc, candidate_uid);
-                                                    debug!(
-                                                        "UDP: remapped audio ssrc {} from user {} to {} with alternate RTP ext handling",
-                                                        ssrc, uid, candidate_uid
-                                                    );
-                                                    recovered = Some(decrypted);
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    if let Some(decrypted) = recovered {
-                                        (Some(decrypted), false)
-                                    } else {
-                                        debug!(
-                                            "UDP drop: DAVE audio decrypt failed for {uid}: {e}"
-                                        );
-                                        let recovery = dm.track_decrypt_failure();
-                                        (None, recovery)
-                                    }
+                            for candidate_uid in candidate_user_ids {
+                                if let Some((decrypted, _used_fallback_payload)) =
+                                    try_decrypt_audio_payload_for_user(
+                                        dm,
+                                        candidate_uid,
+                                        &primary_payload,
+                                        fallback_payload,
+                                        ssrc,
+                                    )
+                                {
+                                    recovered = Some((decrypted, candidate_uid));
+                                    break;
                                 }
                             }
-                        } else {
-                            (Some(primary_payload.clone()), false)
+
+                            if let Some((decrypted, candidate_uid)) = recovered {
+                                if user_id != Some(candidate_uid) {
+                                    ssrc_map.lock().insert(ssrc, candidate_uid);
+                                    info!(
+                                        ssrc,
+                                        old_user_id = user_id,
+                                        new_user_id = candidate_uid,
+                                        "UDP: remapped audio ssrc after successful DAVE decrypt"
+                                    );
+                                }
+                                (Some(decrypted), Some(candidate_uid), false)
+                            } else if let Some(uid) = user_id {
+                                debug!("UDP drop: DAVE audio decrypt failed for {uid}");
+                                let recovery = dm.track_decrypt_failure();
+                                (None, None, recovery)
+                            } else {
+                                debug!(
+                                    ssrc,
+                                    candidate_user_count = dm.known_user_ids().len(),
+                                    "UDP drop: DAVE audio decrypt could not resolve user for unmapped ssrc"
+                                );
+                                let recovery = dm.track_decrypt_failure();
+                                (None, None, recovery)
+                            }
                         }
                     }
-                    _ => (Some(primary_payload.clone()), false),
+                    None => (Some(primary_payload.clone()), None, false),
                 }
             };
 
@@ -2989,6 +3260,16 @@ async fn udp_recv_loop(
                 }
                 continue;
             };
+
+            if let Some(remapped_user_id) = remapped_user_id.filter(|uid| Some(*uid) != user_id) {
+                let _ = event_tx
+                    .send(VoiceEvent::SsrcUpdate {
+                        role,
+                        ssrc,
+                        user_id: remapped_user_id,
+                    })
+                    .await;
+            }
 
             let _ = event_tx
                 .send(VoiceEvent::OpusReceived {
@@ -3053,12 +3334,47 @@ async fn udp_recv_loop(
             continue;
         };
 
+        // Prepend cached SPS+PPS AFTER DAVE decrypt so the DAVE trailer's
+        // unencrypted ranges reference correct offsets in the original frame.
+        let frame = if codec == VideoCodecKind::H264 {
+            video_depacketizers.prepend_cached_h264_params(ssrc, frame)
+        } else {
+            frame
+        };
+
         let keyframe = match codec {
-            VideoCodecKind::H264 => depacketizer_keyframe || h264_annexb_is_keyframe(&frame),
+            VideoCodecKind::H264 => {
+                // Only IDR (NAL type 5) counts as a keyframe for rate-
+                // limiting.  SPS+PPS are prepended to every frame after DAVE
+                // decrypt so ffmpeg can always decode, but that prepend must
+                // NOT cause every frame to bypass the fps gate.
+                depacketizer_keyframe || h264_annexb_has_idr_slice(&frame)
+            }
             VideoCodecKind::Vp8 => {
                 depacketizer_keyframe || frame.first().is_some_and(|byte| byte & 0x01 == 0)
             }
         };
+
+        video_frame_emit_count += 1;
+        if keyframe {
+            video_keyframe_count += 1;
+        }
+        // Log NAL types for the first 5 H264 frames and periodically after that
+        if codec == VideoCodecKind::H264
+            && (video_frame_emit_count <= 5 || video_frame_emit_count % 100 == 0)
+        {
+            let nal_types = collect_annexb_nal_types(&frame);
+            info!(
+                ssrc,
+                frame_bytes = frame.len(),
+                keyframe,
+                depacketizer_keyframe,
+                video_frame_emit_count,
+                video_keyframe_count,
+                nal_types = ?nal_types,
+                "clankvox_h264_frame_nal_diagnostic"
+            );
+        }
 
         let _ = event_tx
             .send(VoiceEvent::VideoFrameReceived {
@@ -3087,13 +3403,14 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::{
-        HelloPayload, OPUS_PT, RTP_HEADER_LEN, ReadyPayload, RemoteVideoResolutionPayload,
-        RemoteVideoStatePayload, RemoteVideoStreamPayload, RemoteVideoTrackBinding,
-        SessionDescriptionPayload, TransportCrypto, TransportRole, VideoCodecKind,
-        VideoDepacketizers, VideoFrameCandidate, VideoStreamDescriptor, VoiceEvent, VoiceOpcode,
-        apply_remote_video_state, build_inactive_video_state_announcement, build_rtp_header,
-        decrypt_video_frame_candidates, parse_rtp_header, parse_user_id, parse_voice_opcode,
-        recv_ready, recv_session_description,
+        HelloPayload, OPUS_PT, RTCP_HEADER_LEN, RTP_HEADER_LEN, ReadyPayload,
+        RemoteVideoResolutionPayload, RemoteVideoStatePayload, RemoteVideoStreamPayload,
+        RemoteVideoTrackBinding, SessionDescriptionPayload, TransportCrypto, TransportRole,
+        VideoCodecKind, VideoDepacketizers, VideoFrameCandidate, VideoStreamDescriptor, VoiceEvent,
+        VoiceOpcode, apply_remote_video_state, build_inactive_video_state_announcement,
+        build_media_sink_wants_payload, build_rtp_header, decrypt_video_frame_candidates,
+        h264_annexb_has_idr_slice, ordered_audio_candidate_user_ids, parse_rtp_header,
+        parse_user_id, parse_voice_opcode, recv_ready, recv_session_description,
     };
     use tokio_tungstenite::tungstenite::Message;
 
@@ -3160,6 +3477,172 @@ mod tests {
             .decrypt(&packet, header.len())
             .expect("decrypt should succeed");
         assert_eq!(decrypted, payload);
+    }
+
+    /// Regression: the rtpsize AEAD AAD covers the RTP fixed header + CSRC
+    /// list + the 4-byte extension header prefix, but NOT the extension body.
+    /// `parse_rtp_header` returns a `header_size` that includes the full
+    /// extension (header + body).  If `decrypt` naively used `header_size` as
+    /// the AAD boundary, every packet with an RTP extension would fail
+    /// decryption — making the bot completely deaf.
+    ///
+    /// Discord's on-wire layout for rtpsize modes:
+    ///   [rtp_fixed_header | ext_prefix | encrypt(ext_body + opus) | tag | nonce]
+    /// AAD = rtp_fixed_header + ext_prefix (16 bytes for CC=0)
+    /// Ciphertext = ext_body + opus payload
+    #[test]
+    fn rtp_decrypt_uses_correct_aad_when_extension_is_present() {
+        let crypto = TransportCrypto::new(&[0xABu8; 32], "aead_aes256_gcm_rtpsize")
+            .expect("crypto should initialize");
+
+        let ssrc = 4284u32;
+        let sequence = 10u16;
+        let timestamp = 960u32;
+        let opus_payload = b"real-opus-frame-data";
+
+        // RTP fixed header: V=2, P=0, X=1, CC=0
+        let mut rtp_header = [0u8; RTP_HEADER_LEN];
+        rtp_header[0] = 0x90; // V=2, X=1
+        rtp_header[1] = OPUS_PT;
+        rtp_header[2..4].copy_from_slice(&sequence.to_be_bytes());
+        rtp_header[4..8].copy_from_slice(&timestamp.to_be_bytes());
+        rtp_header[8..12].copy_from_slice(&ssrc.to_be_bytes());
+
+        // Extension prefix: profile=0xBEDE, length=2 (two 32-bit words of body)
+        let ext_prefix: [u8; 4] = [0xBE, 0xDE, 0x00, 0x02];
+        let ext_body: [u8; 8] = [0x51, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+
+        // AAD = fixed header (12) + extension prefix (4) = 16 bytes
+        let mut aad = Vec::new();
+        aad.extend_from_slice(&rtp_header);
+        aad.extend_from_slice(&ext_prefix);
+        assert_eq!(aad.len(), 16);
+
+        // Plaintext under encryption = ext_body + opus payload
+        let mut plaintext = Vec::new();
+        plaintext.extend_from_slice(&ext_body);
+        plaintext.extend_from_slice(opus_payload);
+
+        // Encrypt with the correct (small) AAD
+        let encrypted = crypto.encrypt(&aad, &plaintext).expect("encrypt");
+
+        // Assemble on-wire packet: [aad | ciphertext+tag | nonce]
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&aad);
+        packet.extend_from_slice(&encrypted);
+
+        // parse_rtp_header sees the ciphertext starting at offset 16 (right
+        // after the AAD), reads the first 4 bytes of ciphertext as if they
+        // were the extension prefix, and interprets the "length" field to
+        // compute a header_size that is LARGER than the true AAD.
+        let (_, _, _, parsed_header_size, _) =
+            parse_rtp_header(&packet).expect("rtp header should parse");
+        assert!(
+            parsed_header_size > aad.len(),
+            "parse_rtp_header should report a header_size ({parsed_header_size}) \
+             larger than the true AAD ({}), exposing the mismatch",
+            aad.len()
+        );
+
+        // decrypt() must recompute the correct AAD boundary from the packet
+        // bytes, ignoring the too-large header_size.
+        let decrypted = crypto
+            .decrypt(&packet, parsed_header_size)
+            .expect("decrypt must succeed with extension present");
+        assert_eq!(decrypted, plaintext);
+
+        // Verify that using header_size directly as AAD would fail — this is
+        // the exact bug that made the bot deaf.
+        let wrong_aad_result = crypto.decrypt_with_aad(&packet, parsed_header_size);
+        assert!(
+            wrong_aad_result.is_err(),
+            "using full header_size as AAD should fail decryption"
+        );
+    }
+
+    #[test]
+    fn media_sink_wants_payload_includes_streams_and_pixel_counts() {
+        let payload = build_media_sink_wants_payload(
+            &[(4088, 100), (4099, 0)],
+            &[(4088, 921_600.0), (4099, 230_400.0)],
+        );
+
+        assert_eq!(payload["op"].as_u64(), Some(15));
+        assert_eq!(payload["d"]["any"].as_u64(), Some(100));
+        assert_eq!(payload["d"]["streams"]["4088"].as_u64(), Some(100));
+        assert_eq!(payload["d"]["streams"]["4099"].as_u64(), Some(0));
+        assert_eq!(payload["d"]["pixelCounts"]["4088"].as_f64(), Some(921_600.0));
+        assert_eq!(payload["d"]["pixelCounts"]["4099"].as_f64(), Some(230_400.0));
+    }
+
+    #[test]
+    fn ordered_audio_candidate_user_ids_tries_known_users_when_ssrc_map_is_missing() {
+        let ordered = ordered_audio_candidate_user_ids(None, 999, &[999, 42, 43]);
+        assert_eq!(ordered, vec![42, 43]);
+    }
+
+    #[test]
+    fn ordered_audio_candidate_user_ids_prefers_current_mapping_before_other_known_users() {
+        let ordered = ordered_audio_candidate_user_ids(Some(42), 999, &[999, 42, 43]);
+        assert_eq!(ordered, vec![42, 43]);
+    }
+
+    #[test]
+    fn protected_rtcp_feedback_packets_round_trip() {
+        let crypto = TransportCrypto::new(&[5u8; 32], "aead_aes256_gcm_rtpsize")
+            .expect("crypto should initialize");
+        let sender_ssrc = 0x1122_3344u32;
+        let media_ssrc = 0x5566_7788u32;
+
+        let rr_packet = crypto
+            .build_protected_rtcp_packet(0, 201, &sender_ssrc.to_be_bytes())
+            .expect("rr packet");
+
+        let mut pli_body = [0u8; 8];
+        pli_body[0..4].copy_from_slice(&sender_ssrc.to_be_bytes());
+        pli_body[4..8].copy_from_slice(&media_ssrc.to_be_bytes());
+        let pli_packet = crypto
+            .build_protected_rtcp_packet(1, 206, &pli_body)
+            .expect("pli packet");
+
+        let mut fir_body = [0u8; 16];
+        fir_body[0..4].copy_from_slice(&sender_ssrc.to_be_bytes());
+        fir_body[8..12].copy_from_slice(&media_ssrc.to_be_bytes());
+        let fir_packet = crypto
+            .build_protected_rtcp_packet(4, 206, &fir_body)
+            .expect("fir packet");
+
+        assert_eq!(rr_packet.len(), 28);
+        assert_eq!(rr_packet[0], 0x80);
+        assert_eq!(rr_packet[1], 201);
+        assert_eq!(u16::from_be_bytes([rr_packet[2], rr_packet[3]]), 6);
+        let rr_body = crypto
+            .decrypt_with_aad(&rr_packet, RTCP_HEADER_LEN)
+            .expect("rr decrypt");
+        assert_eq!(rr_body, sender_ssrc.to_be_bytes());
+
+        assert_eq!(pli_packet.len(), 32);
+        assert_eq!(pli_packet[0], 0x81);
+        assert_eq!(pli_packet[1], 206);
+        assert_eq!(u16::from_be_bytes([pli_packet[2], pli_packet[3]]), 7);
+        let pli_body = crypto
+            .decrypt_with_aad(&pli_packet, RTCP_HEADER_LEN)
+            .expect("pli decrypt");
+        assert_eq!(&pli_body[0..4], &sender_ssrc.to_be_bytes());
+        assert_eq!(&pli_body[4..8], &media_ssrc.to_be_bytes());
+
+        assert_eq!(fir_packet.len(), 40);
+        assert_eq!(fir_packet[0], 0x84);
+        assert_eq!(fir_packet[1], 206);
+        assert_eq!(u16::from_be_bytes([fir_packet[2], fir_packet[3]]), 9);
+        let fir_body = crypto
+            .decrypt_with_aad(&fir_packet, RTCP_HEADER_LEN)
+            .expect("fir decrypt");
+        assert_eq!(&fir_body[0..4], &sender_ssrc.to_be_bytes());
+        assert_eq!(&fir_body[4..8], &0u32.to_be_bytes());
+        assert_eq!(&fir_body[8..12], &media_ssrc.to_be_bytes());
+        assert_eq!(fir_body[12], 0);
+        assert_eq!(&fir_body[13..16], &[0, 0, 0]);
     }
 
     #[test]
@@ -3320,6 +3803,56 @@ mod tests {
 
         assert_eq!(frame, vec![0x00, 0xCC]);
         assert!(keyframe);
+    }
+
+    #[test]
+    fn h264_video_depacketizer_does_not_mark_parameter_sets_only_access_unit_as_keyframe() {
+        let mut depacketizers = VideoDepacketizers::default();
+        let ssrc = 779u32;
+        let timestamp = 120_000u32;
+
+        assert_eq!(
+            depacketizers.push(
+                ssrc,
+                VideoCodecKind::H264,
+                40,
+                timestamp,
+                false,
+                &[0x67, 0x4D, 0x00, 0x33, 0xAB, 0x40],
+            ),
+            None
+        );
+        assert_eq!(
+            depacketizers.push(
+                ssrc,
+                VideoCodecKind::H264,
+                41,
+                timestamp,
+                false,
+                &[0x68, 0xEE, 0x3C, 0x80],
+            ),
+            None
+        );
+        let (frame, keyframe) = depacketizers
+            .push(
+                ssrc,
+                VideoCodecKind::H264,
+                42,
+                timestamp,
+                true,
+                &[0x06, 0x05],
+            )
+            .expect("parameter-set access unit should still emit a frame");
+
+        assert_eq!(
+            frame,
+            vec![
+                0, 0, 0, 1, 0x67, 0x4D, 0x00, 0x33, 0xAB, 0x40, 0, 0, 0, 1, 0x68, 0xEE, 0x3C, 0x80,
+                0, 0, 0, 1, 0x06, 0x05
+            ]
+        );
+        assert!(!keyframe);
+        assert!(!h264_annexb_has_idr_slice(&frame));
     }
 
     #[tokio::test]
