@@ -17,6 +17,8 @@ use crate::ipc_protocol::CaptureCommand;
 use crate::video::{RemoteVideoState, UserVideoSubscription};
 use crate::voice_conn::{TransportRole, VoiceEvent};
 
+const FIRST_KEYFRAME_REASSERT_INTERVAL_MS: u64 = 2_000;
+
 fn update_speaking_state(
     speaking_states: &mut std::collections::HashMap<u64, SpeakingState>,
     user_id: u64,
@@ -32,6 +34,33 @@ fn update_speaking_state(
     } else {
         speaking.is_speaking = true;
         true
+    }
+}
+
+fn should_reassert_sink_wants_for_waiting_keyframe(
+    subscription: &mut UserVideoSubscription,
+    keyframe: bool,
+    now: time::Instant,
+) -> bool {
+    if keyframe {
+        subscription.last_keyframe_forwarded_at = Some(now);
+        subscription.last_sink_wants_reasserted_at = None;
+        return false;
+    }
+
+    if subscription.last_keyframe_forwarded_at.is_some() {
+        return false;
+    }
+
+    let reassert_interval = std::time::Duration::from_millis(FIRST_KEYFRAME_REASSERT_INTERVAL_MS);
+    match subscription.last_sink_wants_reasserted_at {
+        Some(last_reasserted_at) if now.duration_since(last_reasserted_at) < reassert_interval => {
+            false
+        }
+        _ => {
+            subscription.last_sink_wants_reasserted_at = Some(now);
+            true
+        }
     }
 }
 
@@ -492,7 +521,7 @@ impl AppState {
                     1.0 / f64::from(subscription.max_frames_per_second.max(1)),
                 );
                 if let Some(last_frame_sent_at) = subscription.last_frame_sent_at {
-                    if now.duration_since(last_frame_sent_at) < min_gap {
+                    if now.duration_since(last_frame_sent_at) < min_gap && !keyframe {
                         return;
                     }
                 }
@@ -515,6 +544,9 @@ impl AppState {
                         "clankvox_first_video_frame_forwarded"
                     );
                 }
+                let should_reassert_sink_wants =
+                    should_reassert_sink_wants_for_waiting_keyframe(subscription, keyframe, now);
+                let codec_for_log = codec.clone();
 
                 let frame_base64 = base64::engine::general_purpose::STANDARD.encode(frame);
                 send_msg(&OutMsg::UserVideoFrame {
@@ -527,6 +559,25 @@ impl AppState {
                     stream_type,
                     rid,
                 });
+                if should_reassert_sink_wants {
+                    tracing::info!(
+                        user_id,
+                        ssrc,
+                        codec = %codec_for_log,
+                        forwarded_frame_count = subscription.forwarded_frame_count,
+                        "clankvox_waiting_for_first_keyframe_reasserting_sink_wants"
+                    );
+                    self.refresh_video_sink_wants("waiting_for_first_keyframe");
+                    if let Some(conn) = self.video_conn() {
+                        if let Err(error) = conn.send_rtcp_pli(ssrc) {
+                            tracing::warn!(
+                                ssrc,
+                                error = %error,
+                                "clankvox_rtcp_pli_failed"
+                            );
+                        }
+                    }
+                }
             }
             VoiceEvent::DaveReady { role } => {
                 tracing::info!(role = role.as_str(), "DAVE E2EE session is ready");
@@ -605,8 +656,9 @@ mod tests {
     use tokio::time;
 
     use crate::capture::SpeakingState;
+    use crate::video::UserVideoSubscription;
 
-    use super::update_speaking_state;
+    use super::{should_reassert_sink_wants_for_waiting_keyframe, update_speaking_state};
 
     #[test]
     fn update_speaking_state_only_triggers_on_first_packet_of_burst() {
@@ -630,5 +682,38 @@ mod tests {
             state.last_packet_at,
             Some(first_packet_at + Duration::from_millis(20))
         );
+    }
+
+    #[test]
+    fn waiting_for_first_keyframe_reasserts_sink_wants_until_keyframe_arrives() {
+        let mut subscription =
+            UserVideoSubscription::new(2, 100, Some(921_600), Some("screen".into()));
+        let started_at = time::Instant::now();
+
+        assert!(should_reassert_sink_wants_for_waiting_keyframe(
+            &mut subscription,
+            false,
+            started_at
+        ));
+        assert!(!should_reassert_sink_wants_for_waiting_keyframe(
+            &mut subscription,
+            false,
+            started_at + Duration::from_millis(500)
+        ));
+        assert!(should_reassert_sink_wants_for_waiting_keyframe(
+            &mut subscription,
+            false,
+            started_at + Duration::from_secs(2)
+        ));
+        assert!(!should_reassert_sink_wants_for_waiting_keyframe(
+            &mut subscription,
+            true,
+            started_at + Duration::from_secs(3)
+        ));
+        assert_eq!(
+            subscription.last_keyframe_forwarded_at,
+            Some(started_at + Duration::from_secs(3))
+        );
+        assert_eq!(subscription.last_sink_wants_reasserted_at, None);
     }
 }

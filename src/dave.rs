@@ -38,6 +38,8 @@ pub struct DaveManager {
     /// Timestamp of when a pv=0 downgrade transition was prepared (OP22).
     /// Used to auto-execute the transition if OP22 never arrives.
     pending_downgrade_since: Option<Instant>,
+    /// Counter for unencrypted passthrough frames, used to rate-limit warnings.
+    unencrypted_passthrough_count: u32,
 }
 
 /// Serialized commit+welcome ready to send as OP28 binary.
@@ -80,6 +82,7 @@ impl DaveManager {
                 consecutive_failures: 0,
                 reinitializing: false,
                 pending_downgrade_since: None,
+                unencrypted_passthrough_count: 0,
             },
             pkg,
         ))
@@ -198,7 +201,30 @@ impl DaveManager {
                 DecryptorDecryptError::UnencryptedWhenPassthroughDisabled,
             )) => {
                 self.consecutive_failures = 0;
-                Ok(frame.to_vec())
+                self.unencrypted_passthrough_count += 1;
+                if self.unencrypted_passthrough_count == 1
+                    || self.unencrypted_passthrough_count % 100 == 0
+                {
+                    warn!(
+                        "DAVE: {label} frame from user {sender_user_id} appears unencrypted \
+                         (passthrough disabled, pv={}, frame_bytes={}, count={})",
+                        self.protocol_version,
+                        frame.len(),
+                        self.unencrypted_passthrough_count,
+                    );
+                }
+                // For video, validate the passthrough frame looks like
+                // plausible H264 before forwarding.  Frames that failed
+                // DAVE marker detection often contain encrypted or padding
+                // bytes that produce garbage H264 — drop these early
+                // rather than wasting an ffmpeg spawn on decode.
+                if media_type == MediaType::VIDEO && !Self::looks_like_valid_h264(frame) {
+                    Err(anyhow::anyhow!(
+                        "decrypt_{label}: passthrough frame failed H264 validation"
+                    ))
+                } else {
+                    Ok(frame.to_vec())
+                }
             }
             Err(e) => Err(anyhow::anyhow!("decrypt_{label}: {e:?}")),
         }
@@ -210,6 +236,50 @@ impl DaveManager {
 
     pub fn decrypt_video(&mut self, sender_user_id: u64, frame: &[u8]) -> Result<Vec<u8>> {
         self.decrypt_media(sender_user_id, MediaType::VIDEO, frame, "video")
+    }
+
+    /// Quick validation that a passthrough video frame looks like plausible
+    /// H264 Annex-B data.  This catches encrypted frames that DAVE
+    /// misclassified as unencrypted — their NAL bodies contain garbage that
+    /// would hang or crash ffmpeg.
+    ///
+    /// Checks performed:
+    /// - Frame starts with an Annex-B start code (00 00 00 01 or 00 00 01)
+    /// - First NAL type byte is a known H264 NAL type (1-12, 24, 28)
+    /// - Frame does not consist entirely of repeated padding bytes
+    fn looks_like_valid_h264(frame: &[u8]) -> bool {
+        // Must start with Annex-B start code
+        let nal_start = if frame.len() >= 4 && frame[..4] == [0, 0, 0, 1] {
+            4
+        } else if frame.len() >= 3 && frame[..3] == [0, 0, 1] {
+            3
+        } else {
+            return false;
+        };
+
+        if nal_start >= frame.len() {
+            return false;
+        }
+
+        // First NAL type must be a recognized H264 NAL unit type
+        let nal_type = frame[nal_start] & 0x1F;
+        let valid_nal_types = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 24, 28];
+        if !valid_nal_types.contains(&nal_type) {
+            return false;
+        }
+
+        // Detect repeated-byte padding (e.g. all 0x4c or 0x7b).
+        // Check the last 16 bytes — if they're all the same byte, suspect
+        // encrypted or padding data.
+        if frame.len() >= 32 {
+            let tail = &frame[frame.len() - 16..];
+            let first = tail[0];
+            if first != 0 && tail.iter().all(|&b| b == first) {
+                return false;
+            }
+        }
+
+        true
     }
 
     pub fn is_ready(&self) -> bool {
