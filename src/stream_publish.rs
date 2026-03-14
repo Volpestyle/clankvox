@@ -124,19 +124,7 @@ fn terminate_stream_publish_child(child: &mut std::process::Child, signal: libc:
     }
 }
 
-fn find_next_start_code(data: &[u8], from: usize) -> Option<(usize, usize)> {
-    let mut index = from;
-    while index + 3 <= data.len() {
-        if data[index..].starts_with(&[0, 0, 1]) {
-            return Some((index, 3));
-        }
-        if index + 4 <= data.len() && data[index..].starts_with(&[0, 0, 0, 1]) {
-            return Some((index, 4));
-        }
-        index += 1;
-    }
-    None
-}
+use crate::h264::find_next_start_code;
 
 fn find_next_aud_start(data: &[u8], from: usize) -> Option<usize> {
     let mut search_from = from;
@@ -668,7 +656,8 @@ impl StreamPublishPlayer {
         let browser_mime_type = mime_type.clone();
 
         let thread = std::thread::spawn(move || {
-            let pipeline_command = build_stream_publish_browser_pipeline_command(&browser_mime_type);
+            let pipeline_command =
+                build_stream_publish_browser_pipeline_command(&browser_mime_type);
             let pipeline_started_at = tokio::time::Instant::now();
             let child = std::process::Command::new("sh")
                 .process_group(0)
@@ -1269,7 +1258,9 @@ impl AppState {
                     self.emit_transport_state(
                         TransportRole::StreamPublish,
                         "failed",
-                        Some(&format!("stream_publish_browser_frame_write_failed: {error}")),
+                        Some(&format!(
+                            "stream_publish_browser_frame_write_failed: {error}"
+                        )),
                     );
                 }
             }
