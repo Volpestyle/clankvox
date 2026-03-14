@@ -386,7 +386,8 @@ impl DaveManager {
         false
     }
 
-    /// Reinitialize the DAVE session from scratch. Returns a `RecoveryAction`
+    /// Reinitialize the DAVE session, preserving external sender state so the
+    /// MLS pending group survives epoch rotations. Returns a `RecoveryAction`
     /// containing the `transition_id` to invalidate (OP31) and a new key package (OP26).
     pub fn reinit(&mut self) -> Result<RecoveryAction> {
         let transition_id = self.last_transition_id;
@@ -398,10 +399,15 @@ impl DaveManager {
         let pv = NonZeroU16::new(self.protocol_version)
             .context("DAVE protocol version must be non-zero for reinit")?;
 
-        let new_session = DaveSession::new(pv, self.user_id, self.channel_id, None)
+        // Use DaveSession::reinit() instead of DaveSession::new() so the
+        // external_sender is preserved and the pending MLS group is recreated.
+        // DaveSession::new() would clear external_sender/group, causing
+        // subsequent OP27 (proposals) to fail with NoGroup and OP30 (welcome)
+        // to fail with NoExternalSender.
+        self.session
+            .reinit(pv, self.user_id, self.channel_id, None)
             .map_err(|e| anyhow::anyhow!("DaveSession reinit: {e:?}"))?;
 
-        self.session = new_session;
         let pkg = self
             .session
             .create_key_package()
