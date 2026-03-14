@@ -2438,6 +2438,14 @@ async fn udp_recv_loop(
                 used_fallback_payload: fallback_payload.is_some(),
             });
 
+        // Skip DAVE decrypt + frame emit entirely when neither depacketizer
+        // produced a complete frame — most RTP packets are mid-frame FU-A
+        // fragments and calling decrypt_video_frame_candidates on them just
+        // burns a mutex lock for a guaranteed None result.
+        if primary_candidate.is_none() && alternate_candidate.is_none() {
+            continue;
+        }
+
         let VideoFrameDecryptOutcome {
             frame: video_frame_opt,
             depacketizer_keyframe,
