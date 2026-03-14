@@ -18,6 +18,11 @@ use crate::video::{RemoteVideoState, UserVideoSubscription};
 use crate::voice_conn::{TransportRole, VoiceEvent};
 
 const FIRST_KEYFRAME_REASSERT_INTERVAL_MS: u64 = 2_000;
+/// Interval between periodic PLI requests after the first keyframe has been
+/// received.  The per-frame ffmpeg decoder can only decode keyframes
+/// independently, so we need fresh keyframes at roughly the vision scanner
+/// rate to keep the brain context up to date.
+const PERIODIC_KEYFRAME_PLI_INTERVAL_MS: u64 = 4_000;
 
 fn update_speaking_state(
     speaking_states: &mut std::collections::HashMap<u64, SpeakingState>,
@@ -48,11 +53,16 @@ fn should_reassert_sink_wants_for_waiting_keyframe(
         return false;
     }
 
-    if subscription.last_keyframe_forwarded_at.is_some() {
-        return false;
-    }
-
-    let reassert_interval = std::time::Duration::from_millis(FIRST_KEYFRAME_REASSERT_INTERVAL_MS);
+    // Before first keyframe: request aggressively at 2s intervals
+    let interval_ms = if subscription.last_keyframe_forwarded_at.is_some() {
+        // After first keyframe: request periodically so the per-frame
+        // decoder gets fresh independently-decodable keyframes for the
+        // vision scanner.
+        PERIODIC_KEYFRAME_PLI_INTERVAL_MS
+    } else {
+        FIRST_KEYFRAME_REASSERT_INTERVAL_MS
+    };
+    let reassert_interval = std::time::Duration::from_millis(interval_ms);
     match subscription.last_sink_wants_reasserted_at {
         Some(last_reasserted_at) if now.duration_since(last_reasserted_at) < reassert_interval => {
             false
