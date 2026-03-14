@@ -73,7 +73,7 @@ Inbound native watch currently works like this:
    - `user_video_state`
    - `user_video_frame`
    - `user_video_end`
-8. Bun decodes sampled keyframes to JPEG and feeds the higher-level screen-watch pipeline
+8. Bun decodes sampled VP8 keyframes and H264 IDR access units to JPEG and feeds the higher-level screen-watch pipeline
 
 The receiver path supports H264 and VP8 receive in the current code.
 
@@ -168,8 +168,80 @@ The sibling reference repos were useful for the shape of the solution:
 - [../src/connection_supervisor.rs](../src/connection_supervisor.rs): role-specific connect/disconnect
 - [../src/ipc.rs](../src/ipc.rs): `stream_watch_*` and `stream_publish_*` IPC messages
 
+## Transport Crypto: rtpsize AAD Rules
+
+Discord's `aead_aes256_gcm_rtpsize` and `aead_xchacha20_poly1305_rtpsize` modes
+authenticate different slices of the packet depending on packet type:
+
+- **RTP media packets:** AAD = RTP fixed header (12 bytes) + CSRC list (cc * 4
+  bytes) + 4-byte extension header prefix (profile + length). The extension
+  body is part of the ciphertext, not the AAD. `parse_rtp_header` returns a
+  `header_size` that includes the full extension body — this value is correct
+  for locating the payload start but must NOT be used as the AAD boundary.
+  `decrypt()` recomputes the AAD from the raw packet bytes.
+- **RTCP packets:** AAD = the 4-byte RTCP fixed header. `decrypt_with_aad()`
+  is used directly with `RTCP_HEADER_LEN`.
+
+Inbound RTCP packets (payload types 72-76 after masking, corresponding to RTCP
+types 200-204 per RFC 5761 mux) are filtered early in the UDP recv loop before
+any decrypt attempt. They are silently skipped because we do not process
+inbound RTCP feedback.
+
+## H264 Keyframe and SPS Strategy
+
+Discord's raw UDP protocol path does not honour PLI or FIR RTCP feedback for
+keyframe requests. PLI/FIR only works through the WebRTC protocol path used by
+reference implementations like `Discord-video-stream`. Since clankvox uses
+`protocol: "udp"`, we cannot request keyframes on demand.
+
+To compensate:
+
+- The H264 depacketizer always prepends cached SPS+PPS to every emitted frame,
+  not just keyframes. `prepend_cached_parameter_sets` is a no-op when the
+  frame already contains inline parameter sets.
+- SPS (NAL type 7) presence in an access unit marks it as `keyframe=true` for
+  forwarding purposes. Discord H264 screen shares send SPS+PPS periodically
+  as sync points even without IDR slices.
+- When both SPS and PPS are cached, ffmpeg can initialize the decoder from any
+  P-slice. The first decoded frame may have visual artifacts, but subsequent
+  frames improve as P-slice prediction converges.
+
+## DAVE Video on Go Live
+
+DAVE per-frame video decryption does not work for Go Live streams. The DAVE
+library reports `UnencryptedWhenPassthroughDisabled` for every video frame,
+but the frame bodies are likely encrypted — feeding them to ffmpeg produces
+`deblocking_filter_idc out of range` and `reference count overflow` errors
+characteristic of encrypted data being parsed as H264.
+
+Current behavior: video frames that fail DAVE decrypt with
+`UnencryptedWhenPassthroughDisabled` are **dropped** for `MediaType::VIDEO`.
+Audio passthrough is still allowed.
+
+The first few frames after DAVE session commit sometimes arrive genuinely
+unencrypted (the sender hasn't started encrypting yet). When those frames
+contain a real IDR (`nal_types=[7, 8, 6, 5]`), they decode successfully and
+bootstrap the screen watch pipeline. After that initial window, DAVE-encrypted
+frames are dropped and no new frames reach Bun until the next unencrypted IDR
+or a session reconnect.
+
+This is a known limitation. Fixing it requires either:
+
+- updating the `davey` crate to correctly handle Go Live video DAVE framing
+- or connecting to Go Live streams using the WebRTC protocol path instead of
+  raw UDP (which would also fix PLI/FIR)
+
+## ffmpeg H264 Decode
+
+Bun decodes H264 access units to JPEG using ffmpeg. The H264 raw demuxer
+(`-f h264`) requires EOF to flush the last access unit. Direct file input
+hangs because the demuxer waits for more data. Bun works around this by
+writing H264 to a temp file, then piping it through `cat | ffmpeg -f h264
+-i pipe:0` which guarantees clean pipe close and EOF delivery.
+
 ## Open Work
 
+- DAVE video decrypt for Go Live streams (see DAVE section above)
 - live Discord validation for sender path
 - broader source support for outbound publish
 - RTX receive/retransmission work on the video side

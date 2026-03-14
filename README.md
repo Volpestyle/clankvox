@@ -1,6 +1,6 @@
 # clankvox
 
-`clankvox` is the Rust media-plane subprocess for Clanky
+`clankvox` is the Rust media-plane subprocess for Clanky.
 
 It owns the Discord voice and Go Live transport work that Bun should not do itself:
 
@@ -90,6 +90,12 @@ The Go Live sender path exists, but current rollout is intentionally narrow:
 - live sender validation on Discord is still a separate follow-up from the code and test coverage already in place
 
 Inbound native screen watch is already integrated end to end through `stream_watch`.
+
+## Known Limitations
+
+- **DAVE video decrypt on Go Live.** The `davey` crate's video decrypt returns `UnencryptedWhenPassthroughDisabled` for Go Live video frames that are likely encrypted. Video frames that fail DAVE decrypt are dropped. Screen watch relies on the unencrypted frames that arrive during the DAVE session transition window.
+- **PLI/FIR does not work.** Discord's media server does not process RTCP PLI/FIR feedback from raw UDP peers (only from WebRTC peers). Keyframes cannot be requested on demand. The H264 depacketizer compensates by always prepending cached SPS+PPS and treating SPS-containing access units as keyframes.
+- **ffmpeg H264 EOF.** The H264 raw demuxer hangs on single-frame input. Bun works around this by piping through `cat | ffmpeg -fflags +genpts -f h264 -i pipe:0`.
 
 ## Related Top-Level Docs
 
