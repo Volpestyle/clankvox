@@ -994,6 +994,7 @@ impl AppState {
         self.stream_publish.active = false;
         self.stream_publish.paused = false;
         self.stream_publish.active_source = None;
+        self.stream_publish_frames_sent = 0;
     }
 
     pub(crate) fn maybe_start_stream_publish_pipeline(&mut self) {
@@ -1344,29 +1345,68 @@ impl AppState {
         if !self.stream_publish.active || self.stream_publish.paused {
             return;
         }
-        let Ok(frame) = self.stream_publish_frame_rx.try_recv() else {
-            return;
-        };
 
-        let encrypted_frame = {
-            let mut guard = self.stream_publish_dave.lock();
-            match *guard {
-                Some(ref mut dave_manager) if dave_manager.is_ready() => dave_manager
-                    .encrypt_video(&frame.access_unit)
-                    .unwrap_or_else(|error| {
-                        tracing::debug!("stream publish DAVE encrypt fallback: {}", error);
-                        frame.access_unit.clone()
-                    }),
-                _ => frame.access_unit.clone(),
-            }
-        };
+        // Drain all available frames this tick rather than just one.
+        // ffmpeg with -re paces output at ~30fps, but read() can deliver
+        // multiple access units in a single stdout chunk.  Sending only
+        // one per 20ms tick can fall behind, causing the viewer to see a
+        // choppy slideshow as frames queue up with stale RTP timestamps.
+        //
+        // Cap at 4 frames per tick to avoid monopolising the event loop
+        // if the queue is deeply backed up (e.g. after unpause).
+        const MAX_FRAMES_PER_TICK: usize = 4;
+        let mut frames_this_tick = 0;
 
-        if let Some(conn) = self.stream_publish_conn.as_ref() {
-            if let Err(error) = conn
-                .send_h264_frame(&encrypted_frame, frame.timestamp_increment)
-                .await
+        while let Ok(frame) = self.stream_publish_frame_rx.try_recv() {
+            frames_this_tick += 1;
+            self.stream_publish_frames_sent += 1;
+            let queue_depth = self.stream_publish_frame_rx.len();
+            if self.stream_publish_frames_sent <= 5
+                || self.stream_publish_frames_sent % 150 == 0
+                || queue_depth > 10
             {
-                warn!(error = %error, "failed to send stream publish video frame");
+                info!(
+                    frame_number = self.stream_publish_frames_sent,
+                    frame_bytes = frame.access_unit.len(),
+                    queue_depth,
+                    frames_this_tick,
+                    timestamp_increment = frame.timestamp_increment,
+                    "clankvox_stream_publish_frame_sent"
+                );
+            }
+
+            let encrypted_frame = {
+                let mut guard = self.stream_publish_dave.lock();
+                match *guard {
+                    Some(ref mut dave_manager) if dave_manager.is_ready() => dave_manager
+                        .encrypt_video(&frame.access_unit)
+                        .unwrap_or_else(|error| {
+                            warn!(error = %error, "stream publish DAVE encrypt fallback to unencrypted");
+                            frame.access_unit.clone()
+                        }),
+                    _ => {
+                        if self.stream_publish_frames_sent <= 3 {
+                            warn!(
+                                frame_number = self.stream_publish_frames_sent,
+                                "stream publish frame sent without DAVE (not ready)"
+                            );
+                        }
+                        frame.access_unit.clone()
+                    }
+                }
+            };
+
+            if let Some(conn) = self.stream_publish_conn.as_ref() {
+                if let Err(error) = conn
+                    .send_h264_frame(&encrypted_frame, frame.timestamp_increment)
+                    .await
+                {
+                    warn!(error = %error, "failed to send stream publish video frame");
+                }
+            }
+
+            if frames_this_tick >= MAX_FRAMES_PER_TICK {
+                break;
             }
         }
     }

@@ -128,6 +128,7 @@ pub(crate) struct AppState {
     pub(crate) buffer_depth_tick_counter: u32,
     pub(crate) buffer_depth_was_nonempty: bool,
     pub(crate) tts_playback_buffered: bool,
+    pub(crate) stream_publish_frames_sent: u64,
 }
 
 impl AppState {
@@ -181,6 +182,7 @@ impl AppState {
             buffer_depth_tick_counter: 0,
             buffer_depth_was_nonempty: false,
             tts_playback_buffered: false,
+            stream_publish_frames_sent: 0,
         }
     }
 
