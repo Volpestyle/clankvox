@@ -54,6 +54,8 @@ pub(crate) struct UserVideoSubscription {
     pub(crate) preferred_stream_type: Option<String>,
     pub(crate) last_frame_sent_at: Option<time::Instant>,
     pub(crate) forwarded_frame_count: u64,
+    pub(crate) last_keyframe_forwarded_at: Option<time::Instant>,
+    pub(crate) last_sink_wants_reasserted_at: Option<time::Instant>,
 }
 
 impl UserVideoSubscription {
@@ -72,6 +74,8 @@ impl UserVideoSubscription {
                 .filter(|stream_type| !stream_type.is_empty()),
             last_frame_sent_at: None,
             forwarded_frame_count: 0,
+            last_keyframe_forwarded_at: None,
+            last_sink_wants_reasserted_at: None,
         }
     }
 }

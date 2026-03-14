@@ -226,7 +226,34 @@ impl DaveManager {
                     Ok(frame.to_vec())
                 }
             }
-            Err(e) => Err(anyhow::anyhow!("decrypt_{label}: {e:?}")),
+            Err(DecryptError::NoDecryptorForUser) => {
+                self.consecutive_failures += 1;
+                if self.consecutive_failures <= 3 || self.consecutive_failures % 50 == 0 {
+                    warn!(
+                        "DAVE: decrypt_{label} NoDecryptorForUser: user_id={sender_user_id}, \
+                         known_users={:?}, pv={}, frame_bytes={}",
+                        self.known_user_ids(),
+                        self.protocol_version,
+                        frame.len(),
+                    );
+                }
+                Err(anyhow::anyhow!(
+                    "decrypt_{label}: no decryptor for user {sender_user_id}"
+                ))
+            }
+            Err(DecryptError::DecryptionFailed(ref inner)) => {
+                self.consecutive_failures += 1;
+                if self.consecutive_failures <= 5 || self.consecutive_failures % 50 == 0 {
+                    warn!(
+                        "DAVE: decrypt_{label} failed: user_id={sender_user_id}, \
+                         error={inner}, pv={}, frame_bytes={}, consecutive_failures={}",
+                        self.protocol_version,
+                        frame.len(),
+                        self.consecutive_failures,
+                    );
+                }
+                Err(anyhow::anyhow!("decrypt_{label}: {e:?}", e = inner))
+            }
         }
     }
 
@@ -479,6 +506,35 @@ impl DaveManager {
 
     pub fn protocol_version(&self) -> u16 {
         self.protocol_version
+    }
+
+    /// Log davey-internal decryption stats for all known users.
+    /// Useful for diagnosing per-user success/failure rates at the MLS layer.
+    pub fn log_decrypt_stats(&self) {
+        for uid in self.known_user_ids() {
+            if let Ok(Some(stats)) = self.session.get_decryption_stats(uid, MediaType::VIDEO) {
+                info!(
+                    user_id = uid,
+                    successes = stats.successes,
+                    failures = stats.failures,
+                    passthroughs = stats.passthroughs,
+                    attempts = stats.attempts,
+                    duration_us = stats.duration,
+                    "clankvox_davey_video_decrypt_stats"
+                );
+            }
+            if let Ok(Some(stats)) = self.session.get_decryption_stats(uid, MediaType::AUDIO) {
+                info!(
+                    user_id = uid,
+                    successes = stats.successes,
+                    failures = stats.failures,
+                    passthroughs = stats.passthroughs,
+                    attempts = stats.attempts,
+                    duration_us = stats.duration,
+                    "clankvox_davey_audio_decrypt_stats"
+                );
+            }
+        }
     }
 }
 

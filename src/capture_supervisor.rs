@@ -1,5 +1,5 @@
-use std::collections::BTreeMap;
 use std::collections::hash_map::Entry;
+use std::collections::BTreeMap;
 
 use audiopus::coder::Decoder as OpusDecoder;
 use audiopus::packet::Packet as OpusPacket;
@@ -9,10 +9,10 @@ use tokio::time;
 
 use crate::app_state::AppState;
 use crate::capture::{
-    SPEAKING_TIMEOUT_MS, SpeakingState, UserCaptureState, normalize_sample_rate,
-    normalize_silence_duration_ms,
+    normalize_sample_rate, normalize_silence_duration_ms, SpeakingState, UserCaptureState,
+    SPEAKING_TIMEOUT_MS,
 };
-use crate::ipc::{OutMsg, send_msg};
+use crate::ipc::{send_msg, OutMsg};
 use crate::ipc_protocol::CaptureCommand;
 use crate::video::{RemoteVideoState, UserVideoSubscription};
 use crate::voice_conn::{TransportRole, VoiceEvent};
