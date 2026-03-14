@@ -262,6 +262,8 @@ pub enum OutMsg {
         stream_type: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         rid: Option<String>,
+        #[serde(rename = "daveDecrypted")]
+        dave_decrypted: bool,
     },
     UserVideoEnd {
         #[serde(rename = "userId")]

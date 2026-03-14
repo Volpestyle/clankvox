@@ -504,6 +504,7 @@ impl AppState {
                 rtp_timestamp,
                 stream_type,
                 rid,
+                dave_decrypted,
             } => {
                 if role == TransportRole::Voice && self.stream_watch_conn.is_some() {
                     return;
@@ -558,6 +559,7 @@ impl AppState {
                     rtp_timestamp,
                     stream_type,
                     rid,
+                    dave_decrypted,
                 });
                 if should_reassert_sink_wants {
                     tracing::info!(

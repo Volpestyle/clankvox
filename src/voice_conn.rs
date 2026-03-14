@@ -206,6 +206,7 @@ pub enum VoiceEvent {
         rtp_timestamp: u32,
         stream_type: Option<String>,
         rid: Option<String>,
+        dave_decrypted: bool,
     },
     DaveReady {
         role: TransportRole,
@@ -2801,6 +2802,8 @@ struct VideoFrameDecryptOutcome {
     frame: Option<Vec<u8>>,
     depacketizer_keyframe: bool,
     needs_recovery: bool,
+    /// True only when DAVE successfully decrypted the frame (not passthrough).
+    dave_decrypted: bool,
 }
 
 fn ordered_audio_candidate_user_ids(
@@ -2909,6 +2912,7 @@ fn decrypt_video_frame_candidates(
             frame: None,
             depacketizer_keyframe: false,
             needs_recovery: false,
+            dave_decrypted: false,
         };
     };
 
@@ -2924,6 +2928,7 @@ fn decrypt_video_frame_candidates(
                     frame: Some(pass_through_candidate.frame.clone()),
                     depacketizer_keyframe: pass_through_candidate.depacketizer_keyframe,
                     needs_recovery: false,
+                    dave_decrypted: false,
                 };
             }
 
@@ -2938,6 +2943,7 @@ fn decrypt_video_frame_candidates(
                     frame: Some(frame),
                     depacketizer_keyframe,
                     needs_recovery: false,
+                    dave_decrypted: true,
                 };
             }
 
@@ -2967,6 +2973,7 @@ fn decrypt_video_frame_candidates(
                         frame: Some(frame),
                         depacketizer_keyframe,
                         needs_recovery: false,
+                        dave_decrypted: true,
                     };
                 }
             }
@@ -2981,12 +2988,14 @@ fn decrypt_video_frame_candidates(
                 frame: None,
                 depacketizer_keyframe: false,
                 needs_recovery: dm.track_decrypt_failure(),
+                dave_decrypted: false,
             }
         }
         None => VideoFrameDecryptOutcome {
             frame: Some(pass_through_candidate.frame.clone()),
             depacketizer_keyframe: pass_through_candidate.depacketizer_keyframe,
             needs_recovery: false,
+            dave_decrypted: false,
         },
     }
 }
@@ -3314,6 +3323,7 @@ async fn udp_recv_loop(
             frame: video_frame_opt,
             depacketizer_keyframe,
             needs_recovery,
+            dave_decrypted,
         } = decrypt_video_frame_candidates(
             &dave,
             &video_ssrc_map,
@@ -3386,6 +3396,7 @@ async fn udp_recv_loop(
                 frame,
                 rtp_timestamp: timestamp,
                 stream_type: binding.descriptor.stream_type.clone(),
+                dave_decrypted,
                 rid: binding.descriptor.rid.clone(),
             })
             .await;
