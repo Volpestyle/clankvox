@@ -250,9 +250,48 @@ impl DaveManager {
                 self.consecutive_failures += 1;
                 self.total_decrypt_failures += 1;
                 if self.total_decrypt_failures <= 3 || self.total_decrypt_failures % 100 == 0 {
+                    // Extract DAVE trailer info for diagnostics
+                    let (has_marker, trailer_nonce, supplemental_size) = if frame.len() >= 11
+                        && frame[frame.len() - 2] == 0xFA
+                        && frame[frame.len() - 1] == 0xFA
+                    {
+                        let supp_size = frame[frame.len() - 3] as usize;
+                        // Truncated nonce is LEB128 encoded after the 8-byte tag
+                        let nonce = if supp_size >= 10 && frame.len() >= supp_size {
+                            let supp_start = frame.len() - supp_size;
+                            // Tag is first 8 bytes, nonce starts at offset 8
+                            let nonce_start = supp_start + 8;
+                            if nonce_start < frame.len() - 3 {
+                                // Read LEB128 (simplified: assume <= 4 bytes)
+                                let mut val: u32 = 0;
+                                let mut shift = 0;
+                                for i in 0..4 {
+                                    if nonce_start + i >= frame.len() - 3 {
+                                        break;
+                                    }
+                                    let b = frame[nonce_start + i];
+                                    val |= ((b & 0x7F) as u32) << shift;
+                                    if b & 0x80 == 0 {
+                                        break;
+                                    }
+                                    shift += 7;
+                                }
+                                Some(val)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        (true, nonce, supp_size)
+                    } else {
+                        (false, None, 0)
+                    };
                     warn!(
                         "DAVE: decrypt_{label} failed: user_id={sender_user_id}, \
-                         error={inner}, pv={}, frame_bytes={}, consecutive={}, total={}",
+                         error={inner}, pv={}, frame_bytes={}, consecutive={}, total={}, \
+                         has_marker={has_marker}, trailer_nonce={trailer_nonce:?}, \
+                         supplemental_size={supplemental_size}",
                         self.protocol_version,
                         frame.len(),
                         self.consecutive_failures,
