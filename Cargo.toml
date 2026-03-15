@@ -3,6 +3,12 @@ name = "clankvox"
 version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
+description = "Rust media-plane subprocess for Discord voice, DAVE E2EE, and Go Live transport"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/Volpestyle/clankvox"
+homepage = "https://github.com/Volpestyle/clankvox"
+keywords = ["discord", "voice", "opus", "rtp", "dave"]
+categories = ["multimedia::audio", "network-programming"]
 
 [lints.rust]
 unsafe_code = "warn"
