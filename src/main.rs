@@ -6,6 +6,7 @@ mod connection_supervisor;
 mod dave;
 mod h264;
 mod ipc;
+mod ipc_log_layer;
 mod ipc_protocol;
 mod ipc_router;
 mod media_sink_wants;
@@ -28,11 +29,13 @@ use std::time::Duration;
 use crossbeam_channel as crossbeam;
 use parking_lot::Mutex;
 use tokio::time;
+use tracing_subscriber::prelude::*;
 
 use crate::app_state::AppState;
 use crate::audio_pipeline::AudioSendState;
 use crate::dave::DaveManager;
 use crate::ipc::{spawn_ipc_reader, spawn_ipc_writer};
+use crate::ipc_log_layer::IpcLogLayer;
 use crate::music::MusicEvent;
 use crate::stream_publish::{StreamPublishEvent, StreamPublishFrame};
 use crate::voice_conn::VoiceEvent;
@@ -53,18 +56,24 @@ async fn main() {
         .install_default()
         .expect("Failed to install rustls crypto provider");
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new(
-                    "info,davey=warn,davey::cryptor::frame_processors=off",
-                )
-            }),
+    // Build layered subscriber: stderr fmt for local dev + IPC forwarding to Bun/Loki.
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(io::stderr)
+                .with_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                        tracing_subscriber::EnvFilter::new(
+                            "info,davey=warn,davey::cryptor::frame_processors=off",
+                        )
+                    }),
+                ),
         )
-        .with_writer(io::stderr)
+        .with(IpcLogLayer)
         .init();
 
     spawn_ipc_writer();
+    ipc_log_layer::mark_ipc_log_ready();
 
     let audio_debug = std::env::var("AUDIO_DEBUG").is_ok();
     let mut inbound_ipc = spawn_ipc_reader(audio_debug);

@@ -320,6 +320,12 @@ pub enum OutMsg {
         #[serde(rename = "musicSamples")]
         music_samples: usize,
     },
+    Log {
+        level: String,
+        target: String,
+        message: String,
+        fields: Value,
+    },
 }
 
 #[derive(Deserialize, Debug, Clone)]
