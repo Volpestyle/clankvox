@@ -145,7 +145,7 @@ pub(crate) fn strip_rtp_extension_payload(
 
     let stripped = decrypted[extension_bytes..].to_vec();
     if profile != &[0xbe, 0xde] {
-        debug!(profile = ?profile, "UDP: non-BEDE RTP extension profile stripped");
+        debug!(profile = ?profile, ext_len, extension_bytes, "UDP: non-BEDE RTP extension profile stripped");
     }
     Some((stripped, Some(decrypted)))
 }

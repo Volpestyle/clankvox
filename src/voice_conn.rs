@@ -2422,20 +2422,25 @@ async fn udp_recv_loop(
             continue;
         };
 
+        // For video, try the full-payload (extension body included) depacketizer
+        // first.  Discord's DAVE encryption operates on the full RTP payload
+        // including extension body bytes — stripping them shifts the DAVE
+        // trailer's byte offsets and causes AES-GCM tag mismatch on ~60% of
+        // frames.  Audio uses the stripped variant as primary (99%+ success).
+        let video_primary_payload = fallback_payload.as_deref().unwrap_or(&primary_payload);
         let primary_candidate = video_depacketizers
+            .push(ssrc, codec, sequence, timestamp, marker, video_primary_payload)
+            .map(|(frame, depacketizer_keyframe)| VideoFrameCandidate {
+                frame,
+                depacketizer_keyframe,
+                used_fallback_payload: fallback_payload.is_some(),
+            });
+        let alternate_candidate = fallback_video_depacketizers
             .push(ssrc, codec, sequence, timestamp, marker, &primary_payload)
             .map(|(frame, depacketizer_keyframe)| VideoFrameCandidate {
                 frame,
                 depacketizer_keyframe,
                 used_fallback_payload: false,
-            });
-        let alternate_payload = fallback_payload.as_deref().unwrap_or(&primary_payload);
-        let alternate_candidate = fallback_video_depacketizers
-            .push(ssrc, codec, sequence, timestamp, marker, alternate_payload)
-            .map(|(frame, depacketizer_keyframe)| VideoFrameCandidate {
-                frame,
-                depacketizer_keyframe,
-                used_fallback_payload: fallback_payload.is_some(),
             });
 
         // Skip DAVE decrypt + frame emit entirely when neither depacketizer
