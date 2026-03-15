@@ -15,6 +15,7 @@ use crate::capture::{
 use crate::ipc::{send_msg, OutMsg};
 use crate::ipc_protocol::CaptureCommand;
 use crate::video::{RemoteVideoState, UserVideoSubscription};
+use crate::video_decoder::PersistentVideoDecoder;
 use crate::voice_conn::{TransportRole, VoiceEvent};
 
 const FIRST_KEYFRAME_REASSERT_INTERVAL_MS: u64 = 2_000;
@@ -125,6 +126,7 @@ impl AppState {
 
     fn remove_user_video_runtime_state(&mut self, user_id: u64) {
         let ended_state = self.remote_video_states.remove(&user_id);
+        self.user_video_decoders.remove(&user_id);
         self.emit_user_video_end(user_id, ended_state.as_ref());
     }
 
@@ -523,70 +525,231 @@ impl AppState {
                     return;
                 }
 
-                let Some(subscription) = self.user_video_subscriptions.get_mut(&user_id) else {
+                if !self.user_video_subscriptions.contains_key(&user_id) {
                     return;
-                };
+                }
 
-                let now = time::Instant::now();
-                let min_gap = std::time::Duration::from_secs_f64(
-                    1.0 / f64::from(subscription.max_frames_per_second.max(1)),
-                );
-                if let Some(last_frame_sent_at) = subscription.last_frame_sent_at {
-                    if now.duration_since(last_frame_sent_at) < min_gap && !keyframe {
+                let is_h264 = codec.eq_ignore_ascii_case("h264");
+
+                if is_h264 {
+                    // ── Persistent H264 decode path ──
+                    //
+                    // Feed EVERY frame to the decoder so it maintains full
+                    // reference-frame state.  Only rate-limit the JPEG
+                    // emission over IPC.
+
+                    // Read subscription values before taking mutable borrows
+                    // on other AppState fields (avoids borrow conflicts).
+                    let max_fps = self.user_video_subscriptions[&user_id].max_frames_per_second;
+
+                    if let Some(subscription) = self.user_video_subscriptions.get_mut(&user_id) {
+                        subscription.forwarded_frame_count =
+                            subscription.forwarded_frame_count.saturating_add(1);
+                        if subscription.forwarded_frame_count == 1 {
+                            tracing::info!(
+                                user_id,
+                                ssrc,
+                                codec = %codec,
+                                keyframe,
+                                frame_bytes = frame.len(),
+                                rtp_timestamp,
+                                stream_type = ?stream_type.as_deref(),
+                                rid = ?rid.as_deref(),
+                                max_frames_per_second = max_fps,
+                                "clankvox_first_video_frame_forwarded"
+                            );
+                        }
+                    }
+
+                    // Lazily create or retrieve the decoder.  If init fails,
+                    // skip H264 decode for this user instead of panicking.
+                    //
+                    // Decode + extract scalar state inside a scoped block so
+                    // the mutable borrow on `user_video_decoders` is released
+                    // before we call `self.refresh_video_sink_wants()` etc.
+                    let (decoded, needs_pli, frames_decoded) = {
+                        let decoder = match self.user_video_decoders.entry(user_id) {
+                            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                            std::collections::hash_map::Entry::Vacant(entry) => {
+                                match PersistentVideoDecoder::new() {
+                                    Ok(d) => {
+                                        tracing::info!(
+                                            user_id,
+                                            ssrc,
+                                            "clankvox_persistent_h264_decoder_created"
+                                        );
+                                        entry.insert(d)
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            user_id,
+                                            error = %e,
+                                            "clankvox_persistent_h264_decoder_init_failed"
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
+                        };
+
+                        let decoded = decoder.decode_frame(&frame);
+                        let needs_pli = decoder.take_pending_pli();
+                        let frames_decoded = decoder.frames_decoded();
+                        (decoded, needs_pli, frames_decoded)
+                    };
+
+                    // If the decoder was reset after sustained errors, it
+                    // needs a fresh keyframe.  Send PLI once.
+                    if needs_pli {
+                        tracing::info!(user_id, ssrc, "clankvox_decoder_reset_requesting_pli");
+                        self.refresh_video_sink_wants("decoder_reset_pli");
+                        if let Some(conn) = self.video_conn() {
+                            if let Err(error) = conn.send_rtcp_pli(ssrc) {
+                                tracing::warn!(
+                                    ssrc,
+                                    error = %error,
+                                    "clankvox_decoder_reset_pli_failed"
+                                );
+                            }
+                        }
+                    }
+
+                    // Rate-limit JPEG emission — only send over IPC at the
+                    // configured FPS.  The decoder still ingested every frame
+                    // above so inter-frame state is intact.
+                    let Some(decoded) = decoded else {
+                        return;
+                    };
+
+                    let now = time::Instant::now();
+                    let min_gap =
+                        std::time::Duration::from_secs_f64(1.0 / f64::from(max_fps.max(1)));
+                    let should_emit =
+                        if let Some(subscription) = self.user_video_subscriptions.get(&user_id) {
+                            match subscription.last_frame_sent_at {
+                                Some(last) => now.duration_since(last) >= min_gap,
+                                None => true,
+                            }
+                        } else {
+                            return;
+                        };
+                    if !should_emit {
                         return;
                     }
-                }
-                subscription.last_frame_sent_at = Some(now);
+                    if let Some(subscription) = self.user_video_subscriptions.get_mut(&user_id) {
+                        subscription.last_frame_sent_at = Some(now);
+                    }
 
-                let frame_bytes = frame.len();
-                subscription.forwarded_frame_count =
-                    subscription.forwarded_frame_count.saturating_add(1);
-                if subscription.forwarded_frame_count == 1 {
-                    tracing::info!(
-                        user_id,
+                    if frames_decoded == 1 {
+                        tracing::info!(
+                            user_id,
+                            ssrc,
+                            width = decoded.width,
+                            height = decoded.height,
+                            jpeg_bytes = decoded.jpeg_data.len(),
+                            change_score = decoded.change_score,
+                            "clankvox_first_h264_frame_decoded"
+                        );
+                    }
+
+                    // Periodic change-score logging for threshold tuning
+                    // (every 60th frame ≈ 30 s at 2 fps).
+                    if frames_decoded % 60 == 0 {
+                        tracing::debug!(
+                            user_id,
+                            ssrc,
+                            frames_decoded,
+                            change_score = %format!("{:.4}", decoded.change_score),
+                            ema_change_score = %format!("{:.4}", decoded.ema_change_score),
+                            is_scene_cut = decoded.is_scene_cut,
+                            "clankvox_frame_diff_periodic"
+                        );
+                    }
+
+                    let jpeg_base64 =
+                        base64::engine::general_purpose::STANDARD.encode(&decoded.jpeg_data);
+                    send_msg(&OutMsg::DecodedVideoFrame {
+                        user_id: user_id.to_string(),
                         ssrc,
-                        codec = %codec,
-                        keyframe,
-                        frame_bytes,
+                        width: decoded.width,
+                        height: decoded.height,
+                        jpeg_base64,
                         rtp_timestamp,
-                        stream_type = ?stream_type.as_deref(),
-                        rid = ?rid.as_deref(),
-                        max_frames_per_second = subscription.max_frames_per_second,
-                        "clankvox_first_video_frame_forwarded"
-                    );
-                }
-                let should_reassert_sink_wants =
-                    should_reassert_sink_wants_for_waiting_keyframe(subscription, keyframe, now);
-                let codec_for_log = codec.clone();
+                        stream_type,
+                        rid,
+                        change_score: decoded.change_score,
+                        ema_change_score: decoded.ema_change_score,
+                        is_scene_cut: decoded.is_scene_cut,
+                    });
+                } else {
+                    // ── Non-H264 (VP8): forward raw frame for TS-side ffmpeg decode ──
+                    let Some(subscription) = self.user_video_subscriptions.get_mut(&user_id) else {
+                        return;
+                    };
 
-                let frame_base64 = base64::engine::general_purpose::STANDARD.encode(frame);
-                send_msg(&OutMsg::UserVideoFrame {
-                    user_id: user_id.to_string(),
-                    ssrc,
-                    codec,
-                    keyframe,
-                    frame_base64,
-                    rtp_timestamp,
-                    stream_type,
-                    rid,
-                    dave_decrypted,
-                });
-                if should_reassert_sink_wants {
-                    tracing::info!(
-                        user_id,
-                        ssrc,
-                        codec = %codec_for_log,
-                        forwarded_frame_count = subscription.forwarded_frame_count,
-                        "clankvox_waiting_for_first_keyframe_reasserting_sink_wants"
+                    let now = time::Instant::now();
+                    let min_gap = std::time::Duration::from_secs_f64(
+                        1.0 / f64::from(subscription.max_frames_per_second.max(1)),
                     );
-                    self.refresh_video_sink_wants("waiting_for_first_keyframe");
-                    if let Some(conn) = self.video_conn() {
-                        if let Err(error) = conn.send_rtcp_pli(ssrc) {
-                            tracing::warn!(
-                                ssrc,
-                                error = %error,
-                                "clankvox_rtcp_pli_failed"
-                            );
+                    if let Some(last_frame_sent_at) = subscription.last_frame_sent_at {
+                        if now.duration_since(last_frame_sent_at) < min_gap && !keyframe {
+                            return;
+                        }
+                    }
+                    subscription.last_frame_sent_at = Some(now);
+
+                    subscription.forwarded_frame_count =
+                        subscription.forwarded_frame_count.saturating_add(1);
+                    if subscription.forwarded_frame_count == 1 {
+                        tracing::info!(
+                            user_id,
+                            ssrc,
+                            codec = %codec,
+                            keyframe,
+                            frame_bytes = frame.len(),
+                            rtp_timestamp,
+                            stream_type = ?stream_type.as_deref(),
+                            rid = ?rid.as_deref(),
+                            max_frames_per_second = subscription.max_frames_per_second,
+                            "clankvox_first_video_frame_forwarded"
+                        );
+                    }
+
+                    let should_reassert_sink_wants =
+                        should_reassert_sink_wants_for_waiting_keyframe(
+                            subscription,
+                            keyframe,
+                            now,
+                        );
+
+                    let frame_base64 = base64::engine::general_purpose::STANDARD.encode(frame);
+                    send_msg(&OutMsg::UserVideoFrame {
+                        user_id: user_id.to_string(),
+                        ssrc,
+                        codec,
+                        keyframe,
+                        frame_base64,
+                        rtp_timestamp,
+                        stream_type: stream_type.clone(),
+                        rid: rid.clone(),
+                        dave_decrypted,
+                    });
+                    if should_reassert_sink_wants {
+                        tracing::info!(
+                            user_id,
+                            ssrc,
+                            forwarded_frame_count = subscription.forwarded_frame_count,
+                            "clankvox_waiting_for_first_keyframe_reasserting_sink_wants"
+                        );
+                        self.refresh_video_sink_wants("waiting_for_first_keyframe");
+                        if let Some(conn) = self.video_conn() {
+                            if let Err(error) = conn.send_rtcp_pli(ssrc) {
+                                tracing::warn!(
+                                    ssrc,
+                                    error = %error,
+                                    "clankvox_rtcp_pli_failed"
+                                );
+                            }
                         }
                     }
                 }

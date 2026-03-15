@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::transport_crypto::{TransportCrypto, TRANSPORT_NONCE_LEN, TRANSPORT_TAG_LEN};
+use crate::transport_crypto::{TRANSPORT_NONCE_LEN, TRANSPORT_TAG_LEN, TransportCrypto};
 
 // ---------------------------------------------------------------------------
 // RTCP header (RFC 3550)

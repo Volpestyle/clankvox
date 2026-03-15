@@ -15,6 +15,7 @@ use crate::ipc::{send_error, send_gateway_voice_state_update, send_msg, ErrorCod
 use crate::music::{drain_music_pcm_queue, MusicEvent, MusicState};
 use crate::stream_publish::{StreamPublishEvent, StreamPublishFrame, StreamPublishState};
 use crate::video::{RemoteVideoState, UserVideoSubscription};
+use crate::video_decoder::PersistentVideoDecoder;
 use crate::voice_conn::{TransportRole, VoiceConnection, VoiceEvent};
 
 pub(crate) fn schedule_reconnect(
@@ -123,6 +124,7 @@ pub(crate) struct AppState {
     pub(crate) self_user_id: Option<u64>,
     pub(crate) user_capture_states: HashMap<u64, UserCaptureState>,
     pub(crate) user_video_subscriptions: HashMap<u64, UserVideoSubscription>,
+    pub(crate) user_video_decoders: HashMap<u64, PersistentVideoDecoder>,
     pub(crate) remote_video_states: HashMap<u64, RemoteVideoState>,
     pub(crate) speaking_states: HashMap<u64, SpeakingState>,
     pub(crate) buffer_depth_tick_counter: u32,
@@ -177,6 +179,7 @@ impl AppState {
             self_user_id: None,
             user_capture_states: HashMap::new(),
             user_video_subscriptions: HashMap::new(),
+            user_video_decoders: HashMap::new(),
             remote_video_states: HashMap::new(),
             speaking_states: HashMap::new(),
             buffer_depth_tick_counter: 0,
@@ -271,10 +274,12 @@ impl AppState {
         let cleared_decoders = self.opus_decoders.len();
         let cleared_speaking_users = self.speaking_states.len();
         let cleared_video_users = self.remote_video_states.len();
+        let cleared_video_decoders = self.user_video_decoders.len();
         self.ssrc_map.clear();
         self.opus_decoders.clear();
         self.speaking_states.clear();
         self.remote_video_states.clear();
+        self.user_video_decoders.clear();
 
         tracing::info!(
             reason = reason,
@@ -282,6 +287,7 @@ impl AppState {
             cleared_decoders,
             cleared_speaking_users,
             cleared_video_users,
+            cleared_video_decoders,
             "cleared voice transport runtime state"
         );
     }
@@ -315,6 +321,7 @@ impl AppState {
         }
 
         self.user_video_subscriptions.remove(&user_id);
+        self.user_video_decoders.remove(&user_id);
         if let Some(state) = self.remote_video_states.remove(&user_id) {
             let end_ssrc = state
                 .video_ssrc

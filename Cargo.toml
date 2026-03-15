@@ -46,6 +46,13 @@ audiopus = "0.3.0-rc.0"
 aes-gcm = "0.10"
 chacha20poly1305 = "0.10"
 
+# Persistent H264 video decoder (Cisco OpenH264 bindings)
+openh264 = "0.9"
+openh264-sys2 = "0.9"
+
+# Fast JPEG encoding for decoded video frames (libjpeg-turbo bindings)
+turbojpeg = "1.4"
+
 # rustls crypto provider (required by tokio-tungstenite's rustls backend)
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 

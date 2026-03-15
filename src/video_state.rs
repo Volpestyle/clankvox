@@ -9,7 +9,7 @@ use tracing::{debug, info, warn};
 
 use crate::rtp::VideoCodecKind;
 use crate::video::{VideoResolution, VideoStreamDescriptor};
-use crate::voice_conn::{parse_user_id, TransportRole, VoiceEvent};
+use crate::voice_conn::{TransportRole, VoiceEvent, parse_user_id};
 
 // ---------------------------------------------------------------------------
 // Payload types deserialized from Discord voice gateway

@@ -18,21 +18,23 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::dave::DaveManager;
-use crate::h264::{H264Depacketizer, collect_annexb_nal_types, h264_annexb_has_idr_slice, split_h264_annexb_nalus};
+use crate::h264::{
+    H264Depacketizer, collect_annexb_nal_types, h264_annexb_has_idr_slice,
+    rewrite_h264_annexb_start_codes, split_h264_annexb_nalus,
+};
 use crate::media_sink_wants::build_media_sink_wants_payload;
 use crate::rtcp::build_protected_rtcp_packet;
 use crate::rtp::{
-    RTP_HEADER_LEN, OPUS_PT,
-    MAX_VIDEO_RTP_CHUNK_BYTES, VIDEO_RTP_EXTENSION_HEADER, VIDEO_RTP_EXTENSION_PAYLOAD,
-    VideoCodecKind, build_rtp_header, build_video_rtp_header, parse_rtp_header,
-    strip_rtp_extension_payload,
+    MAX_VIDEO_RTP_CHUNK_BYTES, OPUS_PT, RTP_HEADER_LEN, VIDEO_RTP_EXTENSION_HEADER,
+    VIDEO_RTP_EXTENSION_PAYLOAD, VideoCodecKind, build_rtp_header, build_video_rtp_header,
+    parse_rtp_header, strip_rtp_extension_payload,
 };
 use crate::transport_crypto::TransportCrypto;
 use crate::video::{VideoResolution, VideoStreamDescriptor};
 use crate::video_state::{
-    RemoteVideoStreamPayload, RemoteVideoStatePayload,
-    RemoteVideoTrackBinding, apply_remote_video_state, build_video_state_announcement,
-    convert_video_stream_descriptor, update_current_video_codec,
+    RemoteVideoStatePayload, RemoteVideoStreamPayload, RemoteVideoTrackBinding,
+    apply_remote_video_state, build_video_state_announcement, convert_video_stream_descriptor,
+    update_current_video_codec,
 };
 use crate::vp8::Vp8Depacketizer;
 
@@ -1977,6 +1979,36 @@ fn try_decrypt_video_candidate_for_user(
                 );
             }
             return Some((frame, candidate.depacketizer_keyframe));
+        }
+
+        if codec == VideoCodecKind::H264 {
+            for (variant_name, variant_frame) in [
+                (
+                    "first_long_rest_short",
+                    rewrite_h264_annexb_start_codes(&candidate.frame, 4, 3),
+                ),
+                (
+                    "all_short",
+                    rewrite_h264_annexb_start_codes(&candidate.frame, 3, 3),
+                ),
+            ] {
+                let Some(variant_frame) = variant_frame else {
+                    continue;
+                };
+                if variant_frame == candidate.frame {
+                    continue;
+                }
+                if let Ok(frame) = dm.decrypt_video(user_id, &variant_frame) {
+                    info!(
+                        user_id,
+                        ssrc,
+                        codec = codec.as_str(),
+                        variant = variant_name,
+                        "UDP: DAVE video decrypt recovered using alternate H264 start-code layout"
+                    );
+                    return Some((frame, candidate.depacketizer_keyframe));
+                }
+            }
         }
     }
 

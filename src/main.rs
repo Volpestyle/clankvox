@@ -16,6 +16,7 @@ mod rtp;
 mod stream_publish;
 mod transport_crypto;
 mod video;
+mod video_decoder;
 mod video_state;
 mod voice_conn;
 mod vp8;

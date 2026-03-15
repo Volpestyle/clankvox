@@ -293,6 +293,38 @@ pub(crate) fn split_h264_annexb_nalus(frame: &[u8]) -> Vec<&[u8]> {
     nalus
 }
 
+pub(crate) fn rewrite_h264_annexb_start_codes(
+    frame: &[u8],
+    first_start_code_len: usize,
+    subsequent_start_code_len: usize,
+) -> Option<Vec<u8>> {
+    let nalus = split_h264_annexb_nalus(frame);
+    if nalus.is_empty() {
+        return None;
+    }
+
+    let extra_start_code_bytes = first_start_code_len
+        + subsequent_start_code_len.saturating_mul(nalus.len().saturating_sub(1));
+    let payload_bytes = nalus.iter().map(|nalu| nalu.len()).sum::<usize>();
+    let mut out = Vec::with_capacity(extra_start_code_bytes + payload_bytes);
+
+    for (index, nalu) in nalus.into_iter().enumerate() {
+        let start_code_len = if index == 0 {
+            first_start_code_len
+        } else {
+            subsequent_start_code_len
+        };
+        match start_code_len {
+            3 => out.extend_from_slice(&[0, 0, 1]),
+            4 => out.extend_from_slice(&[0, 0, 0, 1]),
+            _ => return None,
+        }
+        out.extend_from_slice(nalu);
+    }
+
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,5 +386,30 @@ mod tests {
         );
         assert!(!keyframe);
         assert!(!h264_annexb_has_idr_slice(&frame));
+    }
+
+    #[test]
+    fn rewrite_h264_annexb_start_codes_supports_short_variants() {
+        let frame = vec![
+            0, 0, 0, 1, 0x67, 0x11, 0x22, 0, 0, 0, 1, 0x68, 0x33, 0, 0, 0, 1, 0x65, 0x44, 0x55,
+        ];
+
+        let hybrid =
+            rewrite_h264_annexb_start_codes(&frame, 4, 3).expect("hybrid rewrite should succeed");
+        let all_short = rewrite_h264_annexb_start_codes(&frame, 3, 3)
+            .expect("all-short rewrite should succeed");
+
+        assert_eq!(
+            hybrid,
+            vec![
+                0, 0, 0, 1, 0x67, 0x11, 0x22, 0, 0, 1, 0x68, 0x33, 0, 0, 1, 0x65, 0x44, 0x55,
+            ]
+        );
+        assert_eq!(
+            all_short,
+            vec![
+                0, 0, 1, 0x67, 0x11, 0x22, 0, 0, 1, 0x68, 0x33, 0, 0, 1, 0x65, 0x44, 0x55
+            ]
+        );
     }
 }

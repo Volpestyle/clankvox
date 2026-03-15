@@ -265,6 +265,32 @@ pub enum OutMsg {
         #[serde(rename = "daveDecrypted")]
         dave_decrypted: bool,
     },
+    /// Pre-decoded video frame (JPEG) from the persistent H264 decoder.
+    /// The TS side can ingest this directly without spawning ffmpeg.
+    DecodedVideoFrame {
+        #[serde(rename = "userId")]
+        user_id: String,
+        ssrc: u32,
+        width: u32,
+        height: u32,
+        #[serde(rename = "jpegBase64")]
+        jpeg_base64: String,
+        #[serde(rename = "rtpTimestamp")]
+        rtp_timestamp: u32,
+        #[serde(rename = "streamType", skip_serializing_if = "Option::is_none")]
+        stream_type: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rid: Option<String>,
+        /// Instantaneous coarse-luma diff score (0.0–1.0).
+        #[serde(rename = "changeScore")]
+        change_score: f32,
+        /// EMA-smoothed change score for filtering single-frame noise.
+        #[serde(rename = "emaChangeScore")]
+        ema_change_score: f32,
+        /// True when instantaneous diff indicates a hard scene cut.
+        #[serde(rename = "isSceneCut")]
+        is_scene_cut: bool,
+    },
     UserVideoEnd {
         #[serde(rename = "userId")]
         user_id: String,
@@ -364,32 +390,35 @@ pub fn send_msg(msg: &OutMsg) {
                     }
                 }
             }
-            OutMsg::UserVideoFrame { user_id, ssrc, .. } => match tx.video_tx.try_send(msg.clone())
-            {
-                Ok(()) => {
-                    let dropped = DROPPED_OUTBOUND_VIDEO_FRAMES.swap(0, Ordering::Relaxed);
-                    if dropped > 0 {
-                        info!(
-                            dropped_video_frames = dropped,
-                            "clankvox_outbound_video_backpressure_recovered"
-                        );
+            OutMsg::UserVideoFrame { user_id, ssrc, .. }
+            | OutMsg::DecodedVideoFrame { user_id, ssrc, .. } => {
+                match tx.video_tx.try_send(msg.clone()) {
+                    Ok(()) => {
+                        let dropped = DROPPED_OUTBOUND_VIDEO_FRAMES.swap(0, Ordering::Relaxed);
+                        if dropped > 0 {
+                            info!(
+                                dropped_video_frames = dropped,
+                                "clankvox_outbound_video_backpressure_recovered"
+                            );
+                        }
+                    }
+                    Err(crossbeam::TrySendError::Full(_)) => {
+                        let dropped =
+                            DROPPED_OUTBOUND_VIDEO_FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+                        if dropped == 1 || dropped % 100 == 0 {
+                            warn!(
+                                user_id,
+                                ssrc,
+                                dropped_video_frames = dropped,
+                                "dropping outbound clankvox video IPC due to backpressure"
+                            );
+                        }
+                    }
+                    Err(crossbeam::TrySendError::Disconnected(_)) => {
+                        error!("failed to send lossy video IPC message: channel disconnected");
                     }
                 }
-                Err(crossbeam::TrySendError::Full(_)) => {
-                    let dropped = DROPPED_OUTBOUND_VIDEO_FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
-                    if dropped == 1 || dropped % 100 == 0 {
-                        warn!(
-                            user_id,
-                            ssrc,
-                            dropped_video_frames = dropped,
-                            "dropping outbound clankvox video IPC due to backpressure"
-                        );
-                    }
-                }
-                Err(crossbeam::TrySendError::Disconnected(_)) => {
-                    error!("failed to send lossy video IPC message: channel disconnected");
-                }
-            },
+            }
             _ => {
                 // Control messages must not block real-time async tasks. Route them
                 // through an unbounded control lane handled by the writer thread.

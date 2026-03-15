@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 
 use crate::rtp::RTP_HEADER_LEN;
@@ -131,7 +131,7 @@ impl TransportCrypto {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rtp::{build_rtp_header, parse_rtp_header, OPUS_PT};
+    use crate::rtp::{OPUS_PT, build_rtp_header, parse_rtp_header};
 
     #[test]
     fn aes256_gcm_transport_crypto_round_trips() {
