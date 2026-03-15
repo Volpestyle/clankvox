@@ -131,7 +131,7 @@ impl AppState {
     }
 
     fn refresh_video_sink_wants(&self, reason: &str) {
-        let Some(conn) = self.video_conn() else {
+        if self.voice_conn.is_none() && self.stream_watch_conn.is_none() {
             tracing::info!(
                 reason = reason,
                 subscribed_user_count = self.user_video_subscriptions.len(),
@@ -139,17 +139,33 @@ impl AppState {
                 "clankvox_video_sink_wants_skipped_no_connection"
             );
             return;
-        };
+        }
 
-        let mut wants: BTreeMap<u32, u8> = BTreeMap::new();
-        let mut pixel_counts: BTreeMap<u32, f64> = BTreeMap::new();
+        // Collect all wants, partitioned by which transport should
+        // carry them.  Screen-share SSRCs go to stream_watch (if
+        // connected), everything else (webcam / unknown) to voice.
+        let mut voice_wants: BTreeMap<u32, u8> = BTreeMap::new();
+        let mut voice_pixels: BTreeMap<u32, f64> = BTreeMap::new();
+        let mut sw_wants: BTreeMap<u32, u8> = BTreeMap::new();
+        let mut sw_pixels: BTreeMap<u32, f64> = BTreeMap::new();
+        let have_sw = self.stream_watch_conn.is_some();
 
         for (&user_id, remote_state) in &self.remote_video_states {
+            // Mark all known SSRCs as "quality 0" (= don't send but
+            // acknowledge existence) on the appropriate transport.
             for stream in &remote_state.streams {
-                wants.entry(stream.ssrc).or_insert(0);
+                let is_screen = stream
+                    .stream_type
+                    .as_deref()
+                    .is_some_and(|t| t.eq_ignore_ascii_case("screen"));
+                if is_screen && have_sw {
+                    sw_wants.entry(stream.ssrc).or_insert(0);
+                } else {
+                    voice_wants.entry(stream.ssrc).or_insert(0);
+                }
             }
             if let Some(video_ssrc) = remote_state.video_ssrc {
-                wants.entry(video_ssrc).or_insert(0);
+                voice_wants.entry(video_ssrc).or_insert(0);
             }
 
             let Some(subscription) = self.user_video_subscriptions.get(&user_id) else {
@@ -157,34 +173,63 @@ impl AppState {
             };
 
             if let Some(stream) = remote_state.preferred_stream(subscription) {
+                let is_screen = stream
+                    .stream_type
+                    .as_deref()
+                    .is_some_and(|t| t.eq_ignore_ascii_case("screen"));
+                let (wants, pixels) = if is_screen && have_sw {
+                    (&mut sw_wants, &mut sw_pixels)
+                } else {
+                    (&mut voice_wants, &mut voice_pixels)
+                };
                 wants.insert(stream.ssrc, subscription.preferred_quality);
                 if let Some(pixel_count) = subscription
                     .preferred_pixel_count
                     .or_else(|| stream.pixel_count_hint())
                 {
-                    pixel_counts.insert(stream.ssrc, f64::from(pixel_count));
+                    pixels.insert(stream.ssrc, f64::from(pixel_count));
                 }
             } else if let Some(video_ssrc) = remote_state.video_ssrc {
-                wants.insert(video_ssrc, subscription.preferred_quality);
+                voice_wants.insert(video_ssrc, subscription.preferred_quality);
                 if let Some(pixel_count) = subscription.preferred_pixel_count {
-                    pixel_counts.insert(video_ssrc, f64::from(pixel_count));
+                    voice_pixels.insert(video_ssrc, f64::from(pixel_count));
                 }
             }
         }
 
-        let wants = wants.into_iter().collect::<Vec<_>>();
-        let pixel_counts = pixel_counts.into_iter().collect::<Vec<_>>();
+        // Send wants to each transport that has entries.
+        let voice_wants_vec = voice_wants.into_iter().collect::<Vec<_>>();
+        let voice_pixels_vec = voice_pixels.into_iter().collect::<Vec<_>>();
+        let sw_wants_vec = sw_wants.into_iter().collect::<Vec<_>>();
+        let sw_pixels_vec = sw_pixels.into_iter().collect::<Vec<_>>();
+
+        let total_wanted = voice_wants_vec.len() + sw_wants_vec.len();
         tracing::info!(
             reason = reason,
             subscribed_user_count = self.user_video_subscriptions.len(),
             remote_video_user_count = self.remote_video_states.len(),
-            wanted_ssrc_count = wants.len(),
-            wanted_streams = ?wants,
-            pixel_count_overrides = ?pixel_counts,
+            wanted_ssrc_count = total_wanted,
+            wanted_streams = ?voice_wants_vec,
+            sw_wanted_streams = ?sw_wants_vec,
+            pixel_count_overrides = ?voice_pixels_vec,
             "clankvox_video_sink_wants_updated"
         );
-        if let Err(error) = conn.update_media_sink_wants(&wants, &pixel_counts) {
-            tracing::warn!(reason = reason, error = %error, "failed to update Discord media sink wants");
+
+        if !voice_wants_vec.is_empty() || !have_sw {
+            if let Some(conn) = self.voice_conn.as_ref() {
+                if let Err(error) =
+                    conn.update_media_sink_wants(&voice_wants_vec, &voice_pixels_vec)
+                {
+                    tracing::warn!(reason = reason, error = %error, "failed to update voice media sink wants");
+                }
+            }
+        }
+        if !sw_wants_vec.is_empty() {
+            if let Some(conn) = self.stream_watch_conn.as_ref() {
+                if let Err(error) = conn.update_media_sink_wants(&sw_wants_vec, &sw_pixels_vec) {
+                    tracing::warn!(reason = reason, error = %error, "failed to update stream_watch media sink wants");
+                }
+            }
         }
     }
 
@@ -333,8 +378,20 @@ impl AppState {
                 codec,
                 streams,
             } => {
+                // When a stream_watch transport exists, screen-share video
+                // state arrives on that transport.  Voice-transport video
+                // state updates for screen shares are redundant — but
+                // webcam ("video") streams only appear on the voice
+                // transport and must be allowed through.
                 if role == TransportRole::Voice && self.stream_watch_conn.is_some() {
-                    return;
+                    let has_non_screen_stream = streams.iter().any(|s| {
+                        s.stream_type
+                            .as_deref()
+                            .is_some_and(|t| !t.eq_ignore_ascii_case("screen"))
+                    });
+                    if !has_non_screen_stream {
+                        return;
+                    }
                 }
                 if self.self_user_id == Some(user_id) {
                     return;
@@ -518,8 +575,20 @@ impl AppState {
                 rid,
                 dave_decrypted,
             } => {
+                // When a stream_watch transport is active, screen-share
+                // video frames arrive on that transport.  Voice-transport
+                // frames for screen shares would be duplicates.  But
+                // webcam frames only arrive on the voice transport —
+                // allow them through based on stream_type.
                 if role == TransportRole::Voice && self.stream_watch_conn.is_some() {
-                    return;
+                    let is_screen = stream_type
+                        .as_deref()
+                        .is_some_and(|t| t.eq_ignore_ascii_case("screen"));
+                    // Also allow through when stream_type is unknown (None)
+                    // since webcam streams sometimes lack a type tag.
+                    if is_screen {
+                        return;
+                    }
                 }
                 if self.self_user_id == Some(user_id) {
                     return;
