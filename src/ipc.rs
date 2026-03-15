@@ -107,6 +107,8 @@ pub enum InMsg {
         preferred_pixel_count: Option<u32>,
         #[serde(rename = "preferredStreamType")]
         preferred_stream_type: Option<String>,
+        #[serde(rename = "jpegQuality")]
+        jpeg_quality: Option<u32>,
     },
     UnsubscribeUserVideo {
         #[serde(rename = "userId")]

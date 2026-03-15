@@ -87,6 +87,7 @@ pub(crate) struct PersistentVideoDecoder {
 /// boundaries, allowing the decoder to produce (potentially concealed)
 /// output instead of refusing with error 18 when reference frames are
 /// missing.
+#[allow(unsafe_code)]
 fn configure_error_concealment(decoder: &mut Decoder) {
     let mut ec_idc: i32 = 4; // ERROR_CON_SLICE_COPY_CROSS_IDR
     unsafe {
@@ -115,6 +116,12 @@ impl PersistentVideoDecoder {
             prev_luma_grid: Vec::new(),
             ema_change: 0.0,
         })
+    }
+
+    /// Update the JPEG compression quality used when encoding decoded frames.
+    /// Clamped to 10..=100.
+    pub(crate) fn set_jpeg_quality(&mut self, quality: i32) {
+        self.jpeg_quality = quality.clamp(10, 100);
     }
 
     /// Feed a raw Annex-B access unit to the persistent decoder.

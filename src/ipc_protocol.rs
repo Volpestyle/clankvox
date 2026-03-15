@@ -58,6 +58,7 @@ pub(crate) enum CaptureCommand {
         preferred_quality: u32,
         preferred_pixel_count: Option<u32>,
         preferred_stream_type: Option<String>,
+        jpeg_quality: Option<u32>,
     },
     UnsubscribeUserVideo {
         user_id: String,
@@ -185,12 +186,14 @@ impl TryFrom<InMsg> for RoutedInMsg {
                 preferred_quality,
                 preferred_pixel_count,
                 preferred_stream_type,
+                jpeg_quality,
             } => Ok(Self::Capture(CaptureCommand::SubscribeUserVideo {
                 user_id,
                 max_frames_per_second,
                 preferred_quality,
                 preferred_pixel_count,
                 preferred_stream_type,
+                jpeg_quality,
             })),
             InMsg::UnsubscribeUserVideo { user_id } => {
                 Ok(Self::Capture(CaptureCommand::UnsubscribeUserVideo {

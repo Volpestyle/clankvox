@@ -274,6 +274,7 @@ impl AppState {
                 preferred_quality,
                 preferred_pixel_count,
                 preferred_stream_type,
+                jpeg_quality,
             } => {
                 let Some(user_id) =
                     crate::app_state::parse_user_id_field(&user_id, "subscribe_user_video")
@@ -285,7 +286,12 @@ impl AppState {
                     preferred_quality,
                     preferred_pixel_count,
                     preferred_stream_type,
+                    jpeg_quality,
                 );
+                // Update JPEG quality on any existing decoder for this user
+                if let Some(decoder) = self.user_video_decoders.get_mut(&user_id) {
+                    decoder.set_jpeg_quality(subscription.jpeg_quality);
+                }
                 let had_cached_remote_state = self.remote_video_states.contains_key(&user_id);
                 tracing::info!(
                     user_id,
@@ -610,6 +616,7 @@ impl AppState {
                     // Read subscription values before taking mutable borrows
                     // on other AppState fields (avoids borrow conflicts).
                     let max_fps = self.user_video_subscriptions[&user_id].max_frames_per_second;
+                    let sub_jpeg_quality = self.user_video_subscriptions[&user_id].jpeg_quality;
 
                     if let Some(subscription) = self.user_video_subscriptions.get_mut(&user_id) {
                         subscription.forwarded_frame_count =
@@ -641,10 +648,12 @@ impl AppState {
                             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                             std::collections::hash_map::Entry::Vacant(entry) => {
                                 match PersistentVideoDecoder::new() {
-                                    Ok(d) => {
+                                    Ok(mut d) => {
+                                        d.set_jpeg_quality(sub_jpeg_quality);
                                         tracing::info!(
                                             user_id,
                                             ssrc,
+                                            jpeg_quality = sub_jpeg_quality,
                                             "clankvox_persistent_h264_decoder_created"
                                         );
                                         entry.insert(d)
@@ -971,7 +980,7 @@ mod tests {
     #[test]
     fn waiting_for_first_keyframe_reasserts_sink_wants_until_keyframe_arrives() {
         let mut subscription =
-            UserVideoSubscription::new(2, 100, Some(921_600), Some("screen".into()));
+            UserVideoSubscription::new(2, 100, Some(921_600), Some("screen".into()), None);
         let started_at = time::Instant::now();
 
         assert!(should_reassert_sink_wants_for_waiting_keyframe(

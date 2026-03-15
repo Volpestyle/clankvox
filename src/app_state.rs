@@ -417,7 +417,7 @@ mod tests {
         );
         state.user_video_subscriptions.insert(
             42,
-            UserVideoSubscription::new(15, 80, Some(1_280 * 720), Some("screen".into())),
+            UserVideoSubscription::new(15, 80, Some(1_280 * 720), Some("screen".into()), None),
         );
         state.remote_video_states.insert(
             42,

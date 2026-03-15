@@ -52,6 +52,7 @@ pub(crate) struct UserVideoSubscription {
     pub(crate) preferred_quality: u8,
     pub(crate) preferred_pixel_count: Option<u32>,
     pub(crate) preferred_stream_type: Option<String>,
+    pub(crate) jpeg_quality: i32,
     pub(crate) last_frame_sent_at: Option<time::Instant>,
     pub(crate) forwarded_frame_count: u64,
     pub(crate) last_keyframe_forwarded_at: Option<time::Instant>,
@@ -64,6 +65,7 @@ impl UserVideoSubscription {
         preferred_quality: u32,
         preferred_pixel_count: Option<u32>,
         preferred_stream_type: Option<String>,
+        jpeg_quality: Option<u32>,
     ) -> Self {
         Self {
             max_frames_per_second: normalize_video_max_fps(max_frames_per_second),
@@ -72,6 +74,9 @@ impl UserVideoSubscription {
             preferred_stream_type: preferred_stream_type
                 .map(|stream_type| stream_type.trim().to_ascii_lowercase())
                 .filter(|stream_type| !stream_type.is_empty()),
+            jpeg_quality: jpeg_quality
+                .map(|q| (q as i32).clamp(10, 100))
+                .unwrap_or(75),
             last_frame_sent_at: None,
             forwarded_frame_count: 0,
             last_keyframe_forwarded_at: None,
