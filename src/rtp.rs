@@ -125,6 +125,34 @@ pub(crate) fn parse_rtp_header(data: &[u8]) -> Option<(u16, u32, u32, usize, boo
     Some((seq, ts, ssrc, header_size, marker))
 }
 
+/// Strip RTP padding from a decrypted payload.
+///
+/// RFC 3550 §5.1: When the P bit is set in the RTP header, the last byte
+/// of the payload indicates how many padding bytes (including itself) are
+/// appended.  Under Discord's `rtpsize` AEAD modes the padding is inside
+/// the encrypted envelope, so it must be stripped **after** transport
+/// decryption and **before** DAVE decryption / depacketization.
+///
+/// Returns the payload with trailing padding removed (or unmodified if
+/// P=0 or the padding count is invalid).
+pub(crate) fn strip_rtp_padding(packet: &[u8], mut decrypted: Vec<u8>) -> Vec<u8> {
+    let has_padding = (packet[0] >> 5) & 0x01 != 0;
+    if !has_padding || decrypted.is_empty() {
+        return decrypted;
+    }
+    let pad_len = *decrypted.last().unwrap() as usize;
+    if pad_len == 0 || pad_len > decrypted.len() {
+        debug!(
+            pad_len,
+            payload_len = decrypted.len(),
+            "UDP: RTP padding byte invalid, not stripping"
+        );
+        return decrypted;
+    }
+    decrypted.truncate(decrypted.len() - pad_len);
+    decrypted
+}
+
 pub(crate) fn strip_rtp_extension_payload(
     packet: &[u8],
     decrypted: Vec<u8>,
@@ -185,5 +213,35 @@ mod tests {
 
         let parsed = parse_rtp_header(&packet).expect("header should parse");
         assert_eq!(parsed, (42, 99, 7, RTP_HEADER_LEN + 8 + 4 + 8, false));
+    }
+
+    #[test]
+    fn strip_rtp_padding_removes_trailing_pad_bytes() {
+        // P bit set (bit 5 of byte 0): 0x80 | 0x20 = 0xA0
+        let mut packet = [0u8; RTP_HEADER_LEN];
+        packet[0] = 0xA0; // V=2, P=1
+                          // Decrypted payload: 4 bytes media + 3 bytes padding (last byte = 3)
+        let decrypted = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00, 0x03];
+        let result = strip_rtp_padding(&packet, decrypted);
+        assert_eq!(result, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[test]
+    fn strip_rtp_padding_noop_when_p_bit_clear() {
+        let mut packet = [0u8; RTP_HEADER_LEN];
+        packet[0] = 0x80; // V=2, P=0
+        let decrypted = vec![0xDE, 0xAD, 0x00, 0x03];
+        let result = strip_rtp_padding(&packet, decrypted.clone());
+        assert_eq!(result, decrypted);
+    }
+
+    #[test]
+    fn strip_rtp_padding_handles_single_byte_pad() {
+        let mut packet = [0u8; RTP_HEADER_LEN];
+        packet[0] = 0xA0; // V=2, P=1
+                          // Single padding byte: last byte = 1
+        let decrypted = vec![0xDE, 0xAD, 0x01];
+        let result = strip_rtp_padding(&packet, decrypted);
+        assert_eq!(result, vec![0xDE, 0xAD]);
     }
 }

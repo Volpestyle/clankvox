@@ -27,7 +27,7 @@ use crate::rtcp::build_protected_rtcp_packet;
 use crate::rtp::{
     MAX_VIDEO_RTP_CHUNK_BYTES, OPUS_PT, RTP_HEADER_LEN, VIDEO_RTP_EXTENSION_HEADER,
     VIDEO_RTP_EXTENSION_PAYLOAD, VideoCodecKind, build_rtp_header, build_video_rtp_header,
-    parse_rtp_header, strip_rtp_extension_payload,
+    parse_rtp_header, strip_rtp_extension_payload, strip_rtp_padding,
 };
 use crate::transport_crypto::TransportCrypto;
 use crate::video::{VideoResolution, VideoStreamDescriptor};
@@ -2121,12 +2121,65 @@ fn decrypt_video_frame_candidates(
                     && c.frame[c.frame.len() - 2] == 0xFA
                     && c.frame[c.frame.len() - 1] == 0xFA
             });
+
+            // Extract DAVE trailer details from the first candidate for diagnostics
+            let (trailer_supp_size, trailer_hex_tail, frame_hex_head) =
+                if let Some(candidate) = ordered_candidates.first() {
+                    let f = &candidate.frame;
+                    let supp = if has_dave_marker && f.len() >= 3 {
+                        Some(f[f.len() - 3] as usize)
+                    } else {
+                        None
+                    };
+                    // Last 24 bytes (or less) in hex for trailer inspection
+                    let tail_start = f.len().saturating_sub(24);
+                    let tail_hex: String = f[tail_start..]
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    // First 24 bytes for start-code / NAL header inspection
+                    let head_len = f.len().min(24);
+                    let head_hex: String = f[..head_len]
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    (supp, tail_hex, head_hex)
+                } else {
+                    (None, String::new(), String::new())
+                };
+
+            // Count internal DAVE markers in the frame body — if > 1 the
+            // sender might be encrypting per-NAL or per-packet rather than
+            // per-frame, and our depacketized assembly is wrong.
+            let internal_marker_count = ordered_candidates
+                .first()
+                .map(|c| {
+                    let f = &c.frame;
+                    if f.len() < 4 {
+                        return 0u32;
+                    }
+                    let mut count = 0u32;
+                    for i in 0..f.len() - 1 {
+                        if f[i] == 0xFA && f[i + 1] == 0xFA {
+                            count += 1;
+                        }
+                    }
+                    count
+                })
+                .unwrap_or(0);
+
             debug!(
                 user_id = current_user_id,
                 ssrc,
                 codec = codec.as_str(),
                 frame_bytes,
                 has_dave_marker,
+                trailer_supp_size,
+                internal_marker_count,
+                trailer_hex_tail,
+                frame_hex_head,
                 candidate_count,
                 known_users = ?known_users,
                 pv = dm.protocol_version(),
@@ -2266,6 +2319,20 @@ async fn udp_recv_loop(
     let mut dave_video_decrypt_fail: u64 = 0;
     let mut dave_video_passthrough: u64 = 0;
 
+    // ── per-packet DAVE marker diagnostic ────────────────────────────
+    // Tracks whether individual RTP video payloads carry DAVE 0xFA 0xFA
+    // markers, which would indicate the sender encrypts per-packet
+    // rather than per-frame. If true, our depacketize-then-decrypt
+    // pipeline is fundamentally wrong and we need to decrypt per-packet
+    // before depacketization.
+    let mut per_packet_dave_marker_total: u64 = 0;
+    let mut per_packet_dave_marker_hits: u64 = 0;
+    let mut per_packet_dave_probe_logged: bool = false;
+    // Counter for byte-level frame dump logging (capped to avoid log flood)
+    let mut frame_byte_dump_ok_count: u64 = 0;
+    let mut frame_byte_dump_fail_count: u64 = 0;
+    const MAX_FRAME_BYTE_DUMPS: u64 = 10;
+
     loop {
         if shutdown.load(Ordering::Relaxed) {
             break;
@@ -2333,6 +2400,13 @@ async fn udp_recv_loop(
                 continue;
             }
         };
+
+        // Strip RTP padding BEFORE extension stripping / depacketization.
+        // Under `rtpsize` AEAD modes the padding is inside the encrypted
+        // envelope.  If not stripped, padding bytes corrupt the H264 frame
+        // body and cause DAVE AES-GCM tag verification failures (~60% of
+        // video frames).
+        let decrypted = strip_rtp_padding(packet, decrypted);
 
         let Some((primary_payload, fallback_payload)) =
             strip_rtp_extension_payload(packet, decrypted)
@@ -2454,8 +2528,70 @@ async fn udp_recv_loop(
             continue;
         };
 
+        // ── per-packet DAVE marker probe ─────────────────────────────
+        // Check if this individual RTP payload has a DAVE trailer. If the
+        // sender encrypts per-packet (not per-frame), each payload ends
+        // with [tag(8)][nonce(leb128)][ranges…][supp_size(1)][0xFA 0xFA].
+        // This probe runs on the first 500 video packets to diagnose
+        // whether our depacketize-then-decrypt approach is wrong.
+        let has_per_pkt_marker = primary_payload.len() >= 11
+            && primary_payload[primary_payload.len() - 2] == 0xFA
+            && primary_payload[primary_payload.len() - 1] == 0xFA;
+        if per_packet_dave_marker_total < 500 {
+            per_packet_dave_marker_total += 1;
+            if has_per_pkt_marker {
+                per_packet_dave_marker_hits += 1;
+            }
+            if per_packet_dave_marker_total == 500 && !per_packet_dave_probe_logged {
+                per_packet_dave_probe_logged = true;
+                let pct = per_packet_dave_marker_hits * 100 / per_packet_dave_marker_total;
+                info!(
+                    per_packet_dave_marker_hits,
+                    per_packet_dave_marker_total,
+                    pct,
+                    "clankvox_per_packet_dave_marker_probe"
+                );
+            }
+        }
+
+        // ── per-packet DAVE decrypt path ─────────────────────────────
+        // If the RTP payload carries a DAVE marker AND is a complete
+        // single-NAL or STAP-A packet (not an FU-A fragment), the sender
+        // may have encrypted at the per-packet level. Try DAVE decrypt on
+        // the raw payload before depacketization.
+        //
+        // We skip FU-A (nal_type 28) because FU-A end fragments happen to
+        // end with the DAVE trailer (0xFA 0xFA) from the encrypted frame,
+        // but they are just fragments — not independently encrypted.
+        let is_fu_a = !primary_payload.is_empty() && (primary_payload[0] & 0x1F) == 28;
+        let should_try_per_pkt = has_per_pkt_marker && marker && !is_fu_a;
+        let mut per_pkt_dave_ok = false;
+        let per_pkt_decrypted_payload;
+        let depacketize_payload: &[u8] = if should_try_per_pkt {
+            // Try per-packet DAVE decrypt
+            let decrypted = {
+                let mut guard = dave.lock();
+                match &mut *guard {
+                    Some(dm) if dm.is_ready() && dm.protocol_version() != 0 => {
+                        dm.decrypt_video(binding.user_id, &primary_payload).ok()
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(d) = decrypted {
+                per_pkt_dave_ok = true;
+                per_pkt_decrypted_payload = d;
+                &per_pkt_decrypted_payload
+            } else {
+                // Per-packet decrypt failed; fall through to normal path
+                &primary_payload
+            }
+        } else {
+            &primary_payload
+        };
+
         let primary_candidate = video_depacketizers
-            .push(ssrc, codec, sequence, timestamp, marker, &primary_payload)
+            .push(ssrc, codec, sequence, timestamp, marker, depacketize_payload)
             .map(|(frame, depacketizer_keyframe)| VideoFrameCandidate {
                 frame,
                 depacketizer_keyframe,
@@ -2478,30 +2614,107 @@ async fn udp_recv_loop(
             continue;
         }
 
-        let VideoFrameDecryptOutcome {
-            frame: video_frame_opt,
-            depacketizer_keyframe,
-            needs_recovery,
-            dave_decrypted,
-        } = decrypt_video_frame_candidates(
-            &dave,
-            &video_ssrc_map,
-            &mut binding,
-            ssrc,
-            codec,
-            primary_candidate,
-            alternate_candidate,
-        );
+        // Capture frame bytes for diagnostic dumps before candidates are consumed
+        let diag_frame_head = primary_candidate.as_ref().map(|c| {
+            let len = c.frame.len().min(32);
+            c.frame[..len]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
+        let diag_frame_tail = primary_candidate.as_ref().map(|c| {
+            let start = c.frame.len().saturating_sub(32);
+            c.frame[start..]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
+        let diag_frame_bytes = primary_candidate.as_ref().map(|c| c.frame.len());
 
-        // Track DAVE video decrypt stats
+        // If per-packet DAVE decrypt already succeeded for every packet in
+        // this frame, the assembled frame is already plain codec data and
+        // must NOT go through frame-level DAVE decrypt (it has no trailer).
+        // Check the assembled frame: if it doesn't have a DAVE marker and
+        // per-packet decrypt was active, emit it directly.
+        let assembled_has_dave_marker = primary_candidate.as_ref().is_some_and(|c| {
+            c.frame.len() >= 2
+                && c.frame[c.frame.len() - 2] == 0xFA
+                && c.frame[c.frame.len() - 1] == 0xFA
+        });
+        let (video_frame_opt, depacketizer_keyframe, needs_recovery, dave_decrypted) =
+            if per_pkt_dave_ok && !assembled_has_dave_marker {
+                // Per-packet decrypt already handled — bypass frame-level DAVE
+                let candidate = primary_candidate.unwrap_or_else(|| {
+                    alternate_candidate.expect("at least one candidate exists")
+                });
+                (
+                    Some(candidate.frame),
+                    candidate.depacketizer_keyframe,
+                    false,
+                    true,
+                )
+            } else {
+                // Standard path: frame-level DAVE decrypt
+                let VideoFrameDecryptOutcome {
+                    frame,
+                    depacketizer_keyframe,
+                    needs_recovery,
+                    dave_decrypted,
+                } = decrypt_video_frame_candidates(
+                    &dave,
+                    &video_ssrc_map,
+                    &mut binding,
+                    ssrc,
+                    codec,
+                    primary_candidate,
+                    alternate_candidate,
+                );
+                (frame, depacketizer_keyframe, needs_recovery, dave_decrypted)
+            };
+
+        // Track DAVE video decrypt stats + byte-level dumps
         if video_frame_opt.is_some() {
             if dave_decrypted {
                 dave_video_decrypt_ok += 1;
+                // Log first N successful frame byte dumps for comparison with failures
+                if frame_byte_dump_ok_count < MAX_FRAME_BYTE_DUMPS {
+                    frame_byte_dump_ok_count += 1;
+                    if let (Some(head), Some(tail), Some(fbytes)) =
+                        (&diag_frame_head, &diag_frame_tail, diag_frame_bytes)
+                    {
+                        info!(
+                            ssrc,
+                            codec = codec.as_str(),
+                            frame_bytes = fbytes,
+                            ok_head = head.as_str(),
+                            ok_tail = tail.as_str(),
+                            "clankvox_dave_video_decrypt_ok_frame_bytes"
+                        );
+                    }
+                }
             } else {
                 dave_video_passthrough += 1;
             }
         } else {
             dave_video_decrypt_fail += 1;
+            // Log first N failed frame byte dumps
+            if frame_byte_dump_fail_count < MAX_FRAME_BYTE_DUMPS {
+                frame_byte_dump_fail_count += 1;
+                if let (Some(head), Some(tail), Some(fbytes)) =
+                    (&diag_frame_head, &diag_frame_tail, diag_frame_bytes)
+                {
+                    info!(
+                        ssrc,
+                        codec = codec.as_str(),
+                        frame_bytes = fbytes,
+                        fail_head = head.as_str(),
+                        fail_tail = tail.as_str(),
+                        "clankvox_dave_video_decrypt_fail_frame_bytes"
+                    );
+                }
+            }
         }
         let dave_total = dave_video_decrypt_ok + dave_video_decrypt_fail + dave_video_passthrough;
         if dave_total > 0 && (dave_total <= 5 || dave_total % 100 == 0) {

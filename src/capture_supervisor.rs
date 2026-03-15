@@ -20,10 +20,10 @@ use crate::voice_conn::{TransportRole, VoiceEvent};
 
 const FIRST_KEYFRAME_REASSERT_INTERVAL_MS: u64 = 2_000;
 /// Interval between periodic PLI requests after the first keyframe has been
-/// received.  The per-frame ffmpeg decoder can only decode keyframes
-/// independently, so we need fresh keyframes at roughly the vision scanner
-/// rate to keep the brain context up to date.
-const PERIODIC_KEYFRAME_PLI_INTERVAL_MS: u64 = 4_000;
+/// received.  With DAVE decrypt failures causing ~45-55% frame loss, the
+/// H264 reference chain accumulates corruption quickly.  Aggressive PLI
+/// ensures the decoder resyncs via IDR frames every 2 seconds.
+const PERIODIC_KEYFRAME_PLI_INTERVAL_MS: u64 = 2_000;
 
 fn update_speaking_state(
     speaking_states: &mut std::collections::HashMap<u64, SpeakingState>,
