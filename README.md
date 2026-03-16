@@ -93,9 +93,9 @@ Inbound native screen watch is already integrated end to end through `stream_wat
 
 ## Known Limitations
 
-- **DAVE video decrypt on Go Live.** The `davey` crate's video decrypt returns `UnencryptedWhenPassthroughDisabled` for Go Live video frames that are likely encrypted. Video frames that fail DAVE decrypt are dropped. Screen watch relies on the unencrypted frames that arrive during the DAVE session transition window.
-- **PLI/FIR does not work.** Discord's media server does not process RTCP PLI/FIR feedback from raw UDP peers (only from WebRTC peers). Keyframes cannot be requested on demand. The H264 depacketizer compensates by always prepending cached SPS+PPS and treating SPS-containing access units as keyframes.
-- **ffmpeg H264 EOF.** The H264 raw demuxer hangs on single-frame input. Bun works around this by piping through `cat | ffmpeg -fflags +genpts -f h264 -i pipe:0`.
+- **DAVE video decrypt on Go Live.** DAVE video decrypt works at near 100% on the main voice connection (after the RTP padding strip fix in `rtp.rs`). Go Live streams are a separate problem: the `davey` crate returns `UnencryptedWhenPassthroughDisabled` for every Go Live video frame, but those frames are actually encrypted. Video frames that fail DAVE decrypt are dropped. Screen watch relies on the unencrypted frames that arrive during the DAVE session transition window. Fixing Go Live requires either updating `davey` to handle Go Live video DAVE framing, or switching to the WebRTC protocol path.
+- **PLI/FIR does not work.** Discord's media server does not process RTCP PLI/FIR feedback from raw UDP peers (only from WebRTC peers). PLI/FIR packets are still sent as a best-effort hint (periodic, after decoder reset, after DAVE ready), but keyframes cannot be requested on demand. The H264 depacketizer compensates by always prepending cached SPS+PPS to every emitted frame (after DAVE decrypt), and the persistent OpenH264 decoder processes all frames (IDR + P-frames) for reference state accumulation.
+- **VP8 ffmpeg decode EOF.** VP8 still uses per-frame ffmpeg decode on the Bun side. The ffmpeg raw demuxer hangs on single-frame input; Bun works around this by piping through `cat | ffmpeg -fflags +genpts -f ivf -i pipe:0`. H264 decode is handled entirely in-process by clankvox's persistent OpenH264 decoder and does not use ffmpeg.
 
 ## Related Top-Level Docs
 

@@ -192,31 +192,42 @@ inbound RTCP feedback.
 Discord's raw UDP protocol path does not honour PLI or FIR RTCP feedback for
 keyframe requests. PLI/FIR only works through the WebRTC protocol path used by
 reference implementations like `Discord-video-stream`. Since clankvox uses
-`protocol: "udp"`, we cannot request keyframes on demand.
+`protocol: "udp"`, we cannot request keyframes on demand. PLI/FIR packets are
+still sent as a best-effort hint in three scenarios: periodic reassertion
+(every 2s), after decoder reset (50 consecutive errors), and after DAVE ready.
 
 To compensate:
 
-- The H264 depacketizer always prepends cached SPS+PPS to every emitted frame,
-  not just keyframes. `prepend_cached_parameter_sets` is a no-op when the
-  frame already contains inline parameter sets.
-- SPS (NAL type 7) presence in an access unit marks it as `keyframe=true` for
-  forwarding purposes. Discord H264 screen shares send SPS+PPS periodically
-  as sync points even without IDR slices.
-- When both SPS and PPS are cached, ffmpeg can initialize the decoder from any
-  P-slice. The first decoded frame may have visual artifacts, but subsequent
-  frames improve as P-slice prediction converges.
+- Cached SPS+PPS are prepended to every emitted frame after DAVE decrypt.
+  `prepend_cached_parameter_sets` is a no-op when the frame already contains
+  inline parameter sets. The prepend happens after DAVE decrypt (not during
+  depacketization) so that DAVE trailer byte offsets remain correct.
+- Only IDR slices (NAL type 5) are treated as keyframes for rate-limiting and
+  forwarding purposes.
+- The persistent OpenH264 decoder processes all frames (IDR + P-frames) for
+  reference state accumulation with error concealment enabled. The first
+  decoded frame may have visual artifacts, but subsequent frames improve as
+  P-slice prediction converges. After 50 consecutive decode errors the decoder
+  auto-resets and requests PLI.
 
-## DAVE Video on Go Live
+## DAVE Video Decrypt
 
-DAVE per-frame video decryption does not work for Go Live streams. The DAVE
-library reports `UnencryptedWhenPassthroughDisabled` for every video frame,
-but the frame bodies are likely encrypted — feeding them to ffmpeg produces
-`deblocking_filter_idc out of range` and `reference count overflow` errors
-characteristic of encrypted data being parsed as H264.
+DAVE video decrypt works at near 100% on the **main voice connection**. The
+root cause of the earlier ~50-60% failure rate was RTP padding bytes not being
+stripped after transport decryption: `strip_rtp_padding()` in `rtp.rs` now
+removes padding before depacketization, which fixed AES-GCM tag verification
+failures on padded FU-A mid-fragments.
+
+**Go Live streams are a separate, still-open problem.** The `davey` crate
+reports `UnencryptedWhenPassthroughDisabled` for every Go Live video frame,
+but the frame bodies are actually encrypted — feeding them to a decoder
+produces `deblocking_filter_idc out of range` and `reference count overflow`
+errors characteristic of encrypted data being parsed as H264.
 
 Current behavior: video frames that fail DAVE decrypt with
-`UnencryptedWhenPassthroughDisabled` are **dropped** for `MediaType::VIDEO`.
-Audio passthrough is still allowed.
+`UnencryptedWhenPassthroughDisabled` are validated by `looks_like_valid_h264()`
+and **dropped** when they appear to be encrypted. Audio passthrough is still
+allowed.
 
 The first few frames after DAVE session commit sometimes arrive genuinely
 unencrypted (the sender hasn't started encrypting yet). When those frames
@@ -225,23 +236,25 @@ bootstrap the screen watch pipeline. After that initial window, DAVE-encrypted
 frames are dropped and no new frames reach Bun until the next unencrypted IDR
 or a session reconnect.
 
-This is a known limitation. Fixing it requires either:
+Fixing Go Live DAVE decrypt requires either:
 
 - updating the `davey` crate to correctly handle Go Live video DAVE framing
 - or connecting to Go Live streams using the WebRTC protocol path instead of
   raw UDP (which would also fix PLI/FIR)
 
-## ffmpeg H264 Decode
+## ffmpeg Video Decode
 
-Bun decodes H264 access units to JPEG using ffmpeg. The H264 raw demuxer
-(`-f h264`) requires EOF to flush the last access unit. Direct file input
-hangs because the demuxer waits for more data. Bun works around this by
-writing H264 to a temp file, then piping it through `cat | ffmpeg -f h264
--i pipe:0` which guarantees clean pipe close and EOF delivery.
+H264 decode is handled entirely in-process by clankvox's persistent OpenH264
+decoder (`video_decoder.rs`). H264 frames do not use ffmpeg.
+
+VP8 still uses per-frame ffmpeg decode on the Bun side. The ffmpeg raw demuxer
+hangs on single-frame input; Bun works around this by piping through
+`cat | ffmpeg -fflags +genpts -f ivf -i pipe:0` which guarantees clean pipe
+close and EOF delivery.
 
 ## Open Work
 
-- DAVE video decrypt for Go Live streams (see DAVE section above)
+- DAVE video decrypt for Go Live streams (see DAVE Video Decrypt section above)
 - live Discord validation for sender path
 - broader source support for outbound publish
 - RTX receive/retransmission work on the video side
