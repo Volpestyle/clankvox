@@ -161,6 +161,7 @@ pub enum VoiceEvent {
         role: TransportRole,
         ssrc: u32,
         opus_frame: Vec<u8>,
+        rtp_sequence: u16,
     },
     VideoFrameReceived {
         role: TransportRole,
@@ -2510,6 +2511,7 @@ async fn udp_recv_loop(
                     role,
                     ssrc,
                     opus_frame,
+                    rtp_sequence: sequence,
                 })
                 .await;
             continue;

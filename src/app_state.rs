@@ -120,6 +120,8 @@ pub(crate) struct AppState {
     pub(crate) music: MusicState,
     pub(crate) stream_publish: StreamPublishState,
     pub(crate) opus_decoders: HashMap<u32, OpusDecoder>,
+    /// Last RTP sequence number seen per audio SSRC, for gap detection / FEC / PLC.
+    pub(crate) last_rtp_seq: HashMap<u32, u16>,
     pub(crate) ssrc_map: HashMap<u32, u64>,
     pub(crate) self_user_id: Option<u64>,
     pub(crate) user_capture_states: HashMap<u64, UserCaptureState>,
@@ -175,6 +177,7 @@ impl AppState {
             music: MusicState::default(),
             stream_publish: StreamPublishState::default(),
             opus_decoders: HashMap::new(),
+            last_rtp_seq: HashMap::new(),
             ssrc_map: HashMap::new(),
             self_user_id: None,
             user_capture_states: HashMap::new(),
@@ -277,6 +280,7 @@ impl AppState {
         let cleared_video_decoders = self.user_video_decoders.len();
         self.ssrc_map.clear();
         self.opus_decoders.clear();
+        self.last_rtp_seq.clear();
         self.speaking_states.clear();
         self.remote_video_states.clear();
         self.user_video_decoders.clear();
@@ -301,6 +305,7 @@ impl AppState {
         self.ssrc_map.retain(|_, v| *v != user_id);
         for ssrc in removed_ssrcs {
             self.opus_decoders.remove(&ssrc);
+            self.last_rtp_seq.remove(&ssrc);
         }
 
         let uid_str = user_id.to_string();

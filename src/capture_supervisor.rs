@@ -18,12 +18,65 @@ use crate::video::{RemoteVideoState, UserVideoSubscription};
 use crate::video_decoder::PersistentVideoDecoder;
 use crate::voice_conn::{TransportRole, VoiceEvent};
 
+/// Maximum number of lost RTP packets for which we attempt FEC/PLC recovery.
+/// Gaps larger than this are likely DTX silence periods or reconnects —
+/// concealment would produce garbage.
+const MAX_RECOVERABLE_GAP: i16 = 5;
+
 const FIRST_KEYFRAME_REASSERT_INTERVAL_MS: u64 = 2_000;
 /// Interval between periodic PLI requests after the first keyframe has been
 /// received.  With DAVE decrypt failures causing ~45-55% frame loss, the
 /// H264 reference chain accumulates corruption quickly.  Aggressive PLI
 /// ensures the decoder resyncs via IDR frames every 2 seconds.
 const PERIODIC_KEYFRAME_PLI_INTERVAL_MS: u64 = 2_000;
+
+/// Classification of an incoming RTP sequence number relative to the last
+/// accepted packet for the same SSRC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RtpSeqClass {
+    /// First packet for this SSRC — no history yet.
+    First,
+    /// Next expected sequence — no loss.
+    Sequential,
+    /// Forward gap: `lost_count` packets were skipped (1..=MAX_RECOVERABLE_GAP).
+    ForwardLoss { lost_count: u16 },
+    /// Forward gap too large to recover — likely DTX or reconnect.
+    ForwardLarge,
+    /// Duplicate of the last accepted packet.
+    Duplicate,
+    /// Stale / reordered — a packet older than the last accepted.
+    Stale,
+}
+
+/// Classify an incoming RTP sequence relative to the last accepted one.
+///
+/// Uses signed distance (i16 cast of wrapping_sub) to correctly handle u16
+/// wraparound. Positive distance = forward gap; negative = stale/reordered.
+fn classify_rtp_sequence(prev_seq: Option<u16>, incoming: u16) -> RtpSeqClass {
+    let Some(prev) = prev_seq else {
+        return RtpSeqClass::First;
+    };
+    let expected = prev.wrapping_add(1);
+    if incoming == expected {
+        return RtpSeqClass::Sequential;
+    }
+    if incoming == prev {
+        return RtpSeqClass::Duplicate;
+    }
+    // Signed distance: positive means the incoming packet is ahead of expected,
+    // negative means it is behind (stale/reordered).
+    let distance = incoming.wrapping_sub(expected) as i16;
+    if distance > 0 && distance <= MAX_RECOVERABLE_GAP {
+        RtpSeqClass::ForwardLoss {
+            lost_count: distance as u16,
+        }
+    } else if distance > MAX_RECOVERABLE_GAP {
+        RtpSeqClass::ForwardLarge
+    } else {
+        // distance <= 0 (or very large u16 wrapping → negative i16)
+        RtpSeqClass::Stale
+    }
+}
 
 fn update_speaking_state(
     speaking_states: &mut std::collections::HashMap<u64, SpeakingState>,
@@ -374,6 +427,7 @@ impl AppState {
                     && self.ssrc_map.insert(ssrc, user_id) != Some(user_id)
                 {
                     self.opus_decoders.remove(&ssrc);
+                    self.last_rtp_seq.remove(&ssrc);
                 }
             }
             VoiceEvent::VideoStateUpdate {
@@ -485,6 +539,7 @@ impl AppState {
                 role,
                 ssrc,
                 opus_frame,
+                rtp_sequence,
             } => {
                 if role != TransportRole::Voice {
                     return;
@@ -497,18 +552,12 @@ impl AppState {
                     return;
                 }
 
-                if update_speaking_state(&mut self.speaking_states, user_id, time::Instant::now()) {
-                    send_msg(&OutMsg::SpeakingStart {
-                        user_id: user_id.to_string(),
-                    });
-                }
-
                 let Some(state) = self.user_capture_states.get(&user_id) else {
                     return;
                 };
                 let target_sample_rate = state.sample_rate;
 
-                let mut pcm_stereo = vec![0i16; 5760];
+                // Ensure an Opus decoder exists for this SSRC.
                 if let Entry::Vacant(entry) = self.opus_decoders.entry(ssrc) {
                     let decoder = match OpusDecoder::new(SampleRate::Hz48000, Channels::Stereo) {
                         Ok(decoder) => decoder,
@@ -524,6 +573,95 @@ impl AppState {
                     entry.insert(decoder);
                 }
 
+                // --- RTP sequence classification ---
+                let seq_class =
+                    classify_rtp_sequence(self.last_rtp_seq.get(&ssrc).copied(), rtp_sequence);
+
+                // Drop stale and duplicate packets — feeding them to the
+                // decoder would corrupt its internal state and produce
+                // out-of-order or doubled audio.  Speaking state is NOT
+                // updated for these packets so that duplicates/reorders
+                // cannot artificially stretch SpeakingStart/SpeakingEnd timing.
+                match seq_class {
+                    RtpSeqClass::Duplicate => {
+                        tracing::debug!(ssrc, rtp_sequence, "Dropped duplicate RTP packet");
+                        return;
+                    }
+                    RtpSeqClass::Stale => {
+                        tracing::debug!(ssrc, rtp_sequence, "Dropped stale/reordered RTP packet");
+                        return;
+                    }
+                    _ => {}
+                }
+
+                // Speaking state is updated only after duplicate/stale
+                // filtering so that discarded packets cannot stretch
+                // speaking activity.
+                if update_speaking_state(&mut self.speaking_states, user_id, time::Instant::now()) {
+                    send_msg(&OutMsg::SpeakingStart {
+                        user_id: user_id.to_string(),
+                    });
+                }
+
+                let decoder = self
+                    .opus_decoders
+                    .get_mut(&ssrc)
+                    .expect("decoder inserted above");
+
+                // Helper: convert decoded stereo PCM to LLM-ready output.
+                let convert_frame = |decoded: &[i16], target_sample_rate: u32| {
+                    crate::audio_pipeline::convert_decoded_to_llm(decoded, target_sample_rate)
+                };
+
+                // --- FEC / PLC for forward packet loss ---
+                // Recovery frames are buffered (not emitted) until the
+                // current anchor packet decodes successfully. If the anchor
+                // fails, the recovery audio is discarded so we never emit
+                // orphaned concealment frames without the real packet that
+                // anchors them.
+                let mut recovery_frames: Vec<(Vec<u8>, u16, usize, usize)> = Vec::new();
+                if let RtpSeqClass::ForwardLoss { lost_count } = seq_class {
+                    let plc_count = lost_count.saturating_sub(1) as usize;
+                    if plc_count > 0 {
+                        tracing::debug!(
+                            ssrc,
+                            lost_count,
+                            plc_count,
+                            "Opus PLC: synthesizing {plc_count} concealment frame(s)"
+                        );
+                    }
+                    for _ in 0..plc_count {
+                        let mut plc_buf = vec![0i16; 5760];
+                        let plc_signals = MutSignals::try_from(plc_buf.as_mut_slice())
+                            .expect("non-empty signal buffer");
+                        if let Ok(plc_samples) = decoder.decode(None, plc_signals, false) {
+                            let total = plc_samples * 2;
+                            recovery_frames
+                                .push(convert_frame(&plc_buf[..total], target_sample_rate));
+                        }
+                    }
+
+                    // Recover the frame immediately before the current packet
+                    // using in-band FEC.
+                    let mut fec_buf = vec![0i16; 5760];
+                    let fec_packet = match OpusPacket::try_from(opus_frame.as_slice()) {
+                        Ok(p) => p,
+                        Err(error) => {
+                            tracing::debug!("Invalid Opus packet (FEC) ssrc={}: {:?}", ssrc, error);
+                            return;
+                        }
+                    };
+                    let fec_signals = MutSignals::try_from(fec_buf.as_mut_slice())
+                        .expect("non-empty signal buffer");
+                    if let Ok(fec_samples) = decoder.decode(Some(fec_packet), fec_signals, true) {
+                        let total = fec_samples * 2;
+                        recovery_frames.push(convert_frame(&fec_buf[..total], target_sample_rate));
+                        tracing::debug!(ssrc, lost_count, "Opus FEC: recovered prior frame");
+                    }
+                }
+
+                // --- Normal decode of the current packet ---
+                let mut pcm_stereo = vec![0i16; 5760];
                 let decode_result = {
                     let packet = match OpusPacket::try_from(opus_frame.as_slice()) {
                         Ok(packet) => packet,
@@ -534,22 +672,29 @@ impl AppState {
                     };
                     let signals = MutSignals::try_from(pcm_stereo.as_mut_slice())
                         .expect("non-empty signal buffer");
-                    self.opus_decoders
-                        .get_mut(&ssrc)
-                        .expect("decoder inserted above")
-                        .decode(Some(packet), signals, false)
+                    decoder.decode(Some(packet), signals, false)
                 };
 
                 match decode_result {
                     Ok(samples_per_channel) => {
-                        let total_samples = samples_per_channel * 2;
-                        let decoded = &pcm_stereo[..total_samples];
+                        // Anchor decode succeeded — emit any buffered recovery
+                        // frames first (in chronological order), then the
+                        // current packet.
+                        for (pcm, peak, active, total) in recovery_frames {
+                            if !pcm.is_empty() {
+                                send_msg(&OutMsg::UserAudio {
+                                    user_id: user_id.to_string(),
+                                    pcm,
+                                    signal_peak_abs: peak,
+                                    signal_active_sample_count: active,
+                                    signal_sample_count: total,
+                                });
+                            }
+                        }
 
+                        let total_samples = samples_per_channel * 2;
                         let (llm_pcm, peak, active, total) =
-                            crate::audio_pipeline::convert_decoded_to_llm(
-                                decoded,
-                                target_sample_rate,
-                            );
+                            convert_frame(&pcm_stereo[..total_samples], target_sample_rate);
                         if !llm_pcm.is_empty() {
                             send_msg(&OutMsg::UserAudio {
                                 user_id: user_id.to_string(),
@@ -558,13 +703,29 @@ impl AppState {
                                 signal_active_sample_count: active,
                                 signal_sample_count: total,
                             });
+                        }
 
-                            if let Some(state) = self.user_capture_states.get_mut(&user_id) {
-                                state.touch_audio(time::Instant::now());
-                            }
+                        // Only advance the sequence tracker after a successful
+                        // decode — failed decodes should not corrupt gap detection.
+                        self.last_rtp_seq.insert(ssrc, rtp_sequence);
+
+                        if let Some(state) = self.user_capture_states.get_mut(&user_id) {
+                            state.touch_audio(time::Instant::now());
                         }
                     }
                     Err(error) => {
+                        // Anchor decode failed — discard buffered recovery
+                        // frames (they were decoded into the Opus decoder's
+                        // state but we do not emit them without a valid anchor).
+                        if !recovery_frames.is_empty() {
+                            tracing::debug!(
+                                ssrc,
+                                rtp_sequence,
+                                recovery_count = recovery_frames.len(),
+                                "Opus anchor decode failed; discarding {count} recovery frame(s)",
+                                count = recovery_frames.len()
+                            );
+                        }
                         tracing::debug!("Opus decode error for ssrc={}: {:?}", ssrc, error);
                     }
                 }
@@ -951,7 +1112,10 @@ mod tests {
     use crate::capture::SpeakingState;
     use crate::video::UserVideoSubscription;
 
-    use super::{should_reassert_sink_wants_for_waiting_keyframe, update_speaking_state};
+    use super::{
+        classify_rtp_sequence, should_reassert_sink_wants_for_waiting_keyframe,
+        update_speaking_state, RtpSeqClass,
+    };
 
     #[test]
     fn update_speaking_state_only_triggers_on_first_packet_of_burst() {
@@ -1008,5 +1172,127 @@ mod tests {
             Some(started_at + Duration::from_secs(3))
         );
         assert_eq!(subscription.last_sink_wants_reasserted_at, None);
+    }
+
+    // --- RTP sequence classification tests ---
+
+    #[test]
+    fn rtp_seq_first_packet_returns_first() {
+        assert_eq!(classify_rtp_sequence(None, 100), RtpSeqClass::First);
+        assert_eq!(classify_rtp_sequence(None, 0), RtpSeqClass::First);
+        assert_eq!(classify_rtp_sequence(None, u16::MAX), RtpSeqClass::First);
+    }
+
+    #[test]
+    fn rtp_seq_sequential_packet() {
+        assert_eq!(
+            classify_rtp_sequence(Some(100), 101),
+            RtpSeqClass::Sequential
+        );
+        assert_eq!(classify_rtp_sequence(Some(0), 1), RtpSeqClass::Sequential);
+    }
+
+    #[test]
+    fn rtp_seq_sequential_wraps_u16() {
+        assert_eq!(
+            classify_rtp_sequence(Some(u16::MAX), 0),
+            RtpSeqClass::Sequential
+        );
+        assert_eq!(
+            classify_rtp_sequence(Some(65534), 65535),
+            RtpSeqClass::Sequential
+        );
+    }
+
+    #[test]
+    fn rtp_seq_duplicate_detected() {
+        assert_eq!(
+            classify_rtp_sequence(Some(100), 100),
+            RtpSeqClass::Duplicate
+        );
+        assert_eq!(classify_rtp_sequence(Some(0), 0), RtpSeqClass::Duplicate);
+        assert_eq!(
+            classify_rtp_sequence(Some(u16::MAX), u16::MAX),
+            RtpSeqClass::Duplicate
+        );
+    }
+
+    #[test]
+    fn rtp_seq_forward_loss_small_gaps() {
+        // Gap of 1 lost packet: prev=100, expected=101, got 102
+        assert_eq!(
+            classify_rtp_sequence(Some(100), 102),
+            RtpSeqClass::ForwardLoss { lost_count: 1 }
+        );
+        // Gap of 3 lost packets
+        assert_eq!(
+            classify_rtp_sequence(Some(100), 104),
+            RtpSeqClass::ForwardLoss { lost_count: 3 }
+        );
+        // Gap of exactly MAX_RECOVERABLE_GAP (5)
+        assert_eq!(
+            classify_rtp_sequence(Some(100), 106),
+            RtpSeqClass::ForwardLoss { lost_count: 5 }
+        );
+    }
+
+    #[test]
+    fn rtp_seq_forward_loss_across_wraparound() {
+        // prev=65534, expected=65535, got 0 → gap of 1 lost packet
+        assert_eq!(
+            classify_rtp_sequence(Some(65534), 0),
+            RtpSeqClass::ForwardLoss { lost_count: 1 }
+        );
+        // prev=65533, expected=65534, got 0 → gap of 2
+        assert_eq!(
+            classify_rtp_sequence(Some(65533), 0),
+            RtpSeqClass::ForwardLoss { lost_count: 2 }
+        );
+    }
+
+    #[test]
+    fn rtp_seq_forward_large_gap() {
+        // Gap of 6 (> MAX_RECOVERABLE_GAP): prev=100, expected=101, got 107
+        assert_eq!(
+            classify_rtp_sequence(Some(100), 107),
+            RtpSeqClass::ForwardLarge
+        );
+        assert_eq!(
+            classify_rtp_sequence(Some(100), 200),
+            RtpSeqClass::ForwardLarge
+        );
+        assert_eq!(
+            classify_rtp_sequence(Some(100), 1000),
+            RtpSeqClass::ForwardLarge
+        );
+    }
+
+    #[test]
+    fn rtp_seq_stale_reordered_packet() {
+        assert_eq!(classify_rtp_sequence(Some(100), 99), RtpSeqClass::Stale);
+        assert_eq!(classify_rtp_sequence(Some(100), 98), RtpSeqClass::Stale);
+        assert_eq!(classify_rtp_sequence(Some(100), 50), RtpSeqClass::Stale);
+    }
+
+    #[test]
+    fn rtp_seq_stale_across_wraparound() {
+        // prev=5, expected=6, got 65535 → stale (late arrival from before wrap)
+        assert_eq!(classify_rtp_sequence(Some(5), 65535), RtpSeqClass::Stale);
+        assert_eq!(classify_rtp_sequence(Some(5), 65534), RtpSeqClass::Stale);
+    }
+
+    #[test]
+    fn rtp_seq_large_forward_near_half_u16_is_forward() {
+        // Distance ~32000 (positive i16) → ForwardLarge
+        assert_eq!(
+            classify_rtp_sequence(Some(0), 32000),
+            RtpSeqClass::ForwardLarge
+        );
+    }
+
+    #[test]
+    fn rtp_seq_large_backward_near_half_u16_is_stale() {
+        // prev=32000, expected=32001, got 0 → wrapping_sub maps to negative i16 → stale
+        assert_eq!(classify_rtp_sequence(Some(32000), 0), RtpSeqClass::Stale);
     }
 }
