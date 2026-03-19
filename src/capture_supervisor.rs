@@ -552,27 +552,6 @@ impl AppState {
                     return;
                 }
 
-                let Some(state) = self.user_capture_states.get(&user_id) else {
-                    return;
-                };
-                let target_sample_rate = state.sample_rate;
-
-                // Ensure an Opus decoder exists for this SSRC.
-                if let Entry::Vacant(entry) = self.opus_decoders.entry(ssrc) {
-                    let decoder = match OpusDecoder::new(SampleRate::Hz48000, Channels::Stereo) {
-                        Ok(decoder) => decoder,
-                        Err(error) => {
-                            tracing::error!(
-                                "failed to init Opus decoder for ssrc={}: {:?}",
-                                ssrc,
-                                error
-                            );
-                            return;
-                        }
-                    };
-                    entry.insert(decoder);
-                }
-
                 // --- RTP sequence classification ---
                 let seq_class =
                     classify_rtp_sequence(self.last_rtp_seq.get(&ssrc).copied(), rtp_sequence);
@@ -596,11 +575,37 @@ impl AppState {
 
                 // Speaking state is updated only after duplicate/stale
                 // filtering so that discarded packets cannot stretch
-                // speaking activity.
+                // speaking activity.  This fires BEFORE the user_capture_states
+                // gate so that the initial SpeakingStart reaches TypeScript and
+                // triggers subscribe_user (bootstrap).
                 if update_speaking_state(&mut self.speaking_states, user_id, time::Instant::now()) {
                     send_msg(&OutMsg::SpeakingStart {
                         user_id: user_id.to_string(),
                     });
+                }
+
+                // Gate audio decode/forwarding on subscription — only users
+                // that TypeScript has subscribed via subscribe_user get their
+                // Opus decoded and forwarded as UserAudio PCM.
+                let Some(state) = self.user_capture_states.get(&user_id) else {
+                    return;
+                };
+                let target_sample_rate = state.sample_rate;
+
+                // Ensure an Opus decoder exists for this SSRC.
+                if let Entry::Vacant(entry) = self.opus_decoders.entry(ssrc) {
+                    let decoder = match OpusDecoder::new(SampleRate::Hz48000, Channels::Stereo) {
+                        Ok(decoder) => decoder,
+                        Err(error) => {
+                            tracing::error!(
+                                "failed to init Opus decoder for ssrc={}: {:?}",
+                                ssrc,
+                                error
+                            );
+                            return;
+                        }
+                    };
+                    entry.insert(decoder);
                 }
 
                 let decoder = self
