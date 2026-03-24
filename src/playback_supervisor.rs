@@ -504,13 +504,28 @@ impl AppState {
         self.tick_pending_stop();
         self.tick_buffer_depth_report();
 
-        let opus_frame = {
+        let (opus_frame, tts_just_drained) = {
             let mut guard = self.audio_send_state.lock();
             match *guard {
-                Some(ref mut state) => state.next_opus_frame(),
-                None => None,
+                Some(ref mut state) => {
+                    let frame = state.next_opus_frame();
+                    let drained = frame.is_none() && state.tts_just_drained();
+                    (frame, drained)
+                }
+                None => (None, false),
             }
         };
+
+        // Emit an immediate drain notification so the TS side learns the TTS
+        // buffer is empty without waiting up to 500ms for the periodic report.
+        // Only send tts_playback_state — do not emit a synthetic buffer_depth
+        // event here because it would need to lie about musicSamples (which
+        // may still be non-zero if music is playing).  The periodic report
+        // will send accurate combined depths on its normal cadence.
+        if tts_just_drained && self.tts_playback_buffered {
+            self.tts_playback_buffered = false;
+            send_tts_playback_state("idle", "tts_drained");
+        }
 
         if let Some(opus) = opus_frame {
             let encrypted = {

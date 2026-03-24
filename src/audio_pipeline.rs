@@ -60,6 +60,18 @@ const MAX_PCM_BUFFER_SAMPLES: usize = 720_000; // 15 seconds @ 48kHz mono
 pub(crate) const MAX_MUSIC_BUFFER_SAMPLES: usize = 96_000; // 2 seconds @ 48kHz mono
 const PARTIAL_TTS_FLUSH_TICKS: u32 = 2; // Flush an underfilled tail after 40ms of no growth
 
+/// Minimum TTS samples to accumulate before starting playback after the buffer
+/// was empty.  This absorbs burst-latency gaps from streaming TTS providers
+/// (e.g. ElevenLabs) at the cost of a small initial delay (~200ms).  Once the
+/// pre-buffer is satisfied, playback runs continuously until the buffer drains.
+const TTS_PREBUFFER_SAMPLES: usize = 9_600; // 200ms @ 48kHz mono
+
+/// Maximum ticks to wait for the pre-buffer to fill before releasing the gate.
+/// If no new samples arrive for this many consecutive ticks, the utterance is
+/// shorter than TTS_PREBUFFER_SAMPLES and we should play it immediately rather
+/// than holding it forever.  3 ticks = 60ms of no growth.
+const TTS_PREBUFFER_STALL_TICKS: u32 = 3;
+
 pub(crate) struct AudioSendState {
     pcm_buffer: VecDeque<i16>,   // TTS audio
     music_buffer: VecDeque<i16>, // Music audio (separate for mixing)
@@ -70,6 +82,17 @@ pub(crate) struct AudioSendState {
     speaking: bool,
     trailing_silence_frames: u32,
     partial_tts_stall_ticks: u32,
+    /// When true, TTS playback has started and the pre-buffer threshold no
+    /// longer applies until the buffer fully drains back to zero.
+    tts_prebuffer_satisfied: bool,
+    /// Tracks how many consecutive ticks the TTS buffer has been below
+    /// TTS_PREBUFFER_SAMPLES without growing.  When this reaches
+    /// TTS_PREBUFFER_STALL_TICKS the gate releases — the utterance is
+    /// shorter than the threshold and no more data is coming.
+    tts_prebuffer_stall_ticks: u32,
+    /// Snapshot of the TTS buffer size on the previous prebuffer-gate tick,
+    /// used to detect whether the buffer is still growing.
+    tts_prebuffer_last_len: usize,
 }
 
 impl AudioSendState {
@@ -88,6 +111,9 @@ impl AudioSendState {
             speaking: false,
             trailing_silence_frames: 0,
             partial_tts_stall_ticks: 0,
+            tts_prebuffer_satisfied: false,
+            tts_prebuffer_stall_ticks: 0,
+            tts_prebuffer_last_len: 0,
         })
     }
 
@@ -191,17 +217,37 @@ impl AudioSendState {
         self.music_output_suppressed = false;
         self.trailing_silence_frames = MAX_TRAILING_SILENCE;
         self.partial_tts_stall_ticks = 0;
+        self.tts_prebuffer_satisfied = false;
+        self.tts_prebuffer_stall_ticks = 0;
+        self.tts_prebuffer_last_len = 0;
     }
 
     fn clear_tts(&mut self) {
         self.pcm_buffer.clear();
         self.partial_tts_stall_ticks = 0;
+        self.tts_prebuffer_satisfied = false;
+        self.tts_prebuffer_stall_ticks = 0;
+        self.tts_prebuffer_last_len = 0;
     }
 
     fn clear_music(&mut self) {
         self.music_buffer.clear();
         self.music_output_suppressed = false;
         self.trailing_silence_frames = MAX_TRAILING_SILENCE;
+    }
+
+    /// Returns true when the TTS buffer has just transitioned from non-empty to
+    /// empty (the trailing silence frames have all been sent).  The caller
+    /// should emit an immediate drain notification to the TS side so the
+    /// output-lock state converges without waiting for the periodic report.
+    pub(crate) fn tts_just_drained(&self) -> bool {
+        // The buffer is empty, we were speaking, and we have exhausted all
+        // trailing silence frames — meaning this tick is the first fully-idle
+        // tick after playback finished.
+        !self.speaking
+            && self.pcm_buffer.is_empty()
+            && self.trailing_silence_frames >= MAX_TRAILING_SILENCE
+            && !self.tts_prebuffer_satisfied
     }
 
     /// Encode the next 20ms frame, mixing TTS and music buffers.
@@ -211,6 +257,53 @@ impl AudioSendState {
         let available_tts = self.pcm_buffer.len();
         let available_music = self.music_buffer.len();
         let has_music = !self.music_output_suppressed && available_music >= AUDIO_FRAME_SAMPLES;
+
+        // Pre-buffer gate: when transitioning from empty to having TTS data,
+        // wait until the buffer reaches TTS_PREBUFFER_SAMPLES before starting
+        // playback.  This absorbs TTS streaming burst gaps so the output is
+        // continuous.  Once the threshold is met, play normally until the
+        // buffer fully drains back to zero.
+        //
+        // Safety valve: if the buffer stops growing for TTS_PREBUFFER_STALL_TICKS
+        // (60ms) without reaching the threshold, the utterance is shorter than
+        // the pre-buffer target — release the gate and play what we have.
+        if !self.tts_prebuffer_satisfied
+            && available_tts > 0
+            && available_tts < TTS_PREBUFFER_SAMPLES
+        {
+            if available_tts > self.tts_prebuffer_last_len {
+                // Buffer is still growing — reset the stall counter.
+                self.tts_prebuffer_stall_ticks = 0;
+            } else {
+                self.tts_prebuffer_stall_ticks = self.tts_prebuffer_stall_ticks.saturating_add(1);
+            }
+            self.tts_prebuffer_last_len = available_tts;
+
+            if self.tts_prebuffer_stall_ticks < TTS_PREBUFFER_STALL_TICKS && !has_music {
+                // Still accumulating — don't produce TTS output yet.
+                self.partial_tts_stall_ticks = 0;
+                return None;
+            }
+            // Stall timeout reached — short utterance, release the gate.
+            self.tts_prebuffer_satisfied = true;
+            info!(
+                buffered_samples = available_tts,
+                buffered_ms = available_tts as f64 / 48.0,
+                stall_ticks = self.tts_prebuffer_stall_ticks,
+                "clankvox_tts_prebuffer_satisfied_short_utterance"
+            );
+        }
+        if available_tts >= TTS_PREBUFFER_SAMPLES && !self.tts_prebuffer_satisfied {
+            self.tts_prebuffer_satisfied = true;
+            self.tts_prebuffer_stall_ticks = 0;
+            self.tts_prebuffer_last_len = 0;
+            info!(
+                buffered_samples = available_tts,
+                buffered_ms = available_tts as f64 / 48.0,
+                "clankvox_tts_prebuffer_satisfied"
+            );
+        }
+
         let has_full_tts = available_tts >= AUDIO_FRAME_SAMPLES;
         let has_partial_tts = available_tts > 0 && available_tts < AUDIO_FRAME_SAMPLES;
 
@@ -291,6 +384,12 @@ impl AudioSendState {
 
         if self.speaking {
             self.speaking = false;
+            // Buffer is fully drained and trailing silence is done — reset the
+            // pre-buffer gate so the next batch of TTS audio gets the full
+            // pre-buffer treatment.
+            self.tts_prebuffer_satisfied = false;
+            self.tts_prebuffer_stall_ticks = 0;
+            self.tts_prebuffer_last_len = 0;
         }
         None
     }
@@ -481,6 +580,8 @@ mod tests {
     #[test]
     fn tts_partial_tail_flushes_after_short_stall() {
         let mut state = AudioSendState::new().expect("audio state");
+        // Bypass prebuffer gate — this test is about partial-tail flush behavior
+        state.tts_prebuffer_satisfied = true;
         state.push_pcm(vec![123; 480]);
 
         assert_eq!(state.tts_buffer_samples(), 480);
@@ -495,6 +596,8 @@ mod tests {
     #[test]
     fn tts_partial_tail_coalesces_before_flush_threshold() {
         let mut state = AudioSendState::new().expect("audio state");
+        // Bypass prebuffer gate — this test is about tail coalescing behavior
+        state.tts_prebuffer_satisfied = true;
         state.push_pcm(vec![123; 480]);
 
         assert!(state.next_opus_frame().is_none());
@@ -505,6 +608,53 @@ mod tests {
             .expect("full frame should encode once tail grows");
         assert!(!frame.is_empty());
         assert_eq!(state.tts_buffer_samples(), 0);
+    }
+
+    #[test]
+    fn tts_prebuffer_gate_holds_output_until_threshold() {
+        let mut state = AudioSendState::new().expect("audio state");
+        // Push less than TTS_PREBUFFER_SAMPLES — should be held
+        state.push_pcm(vec![123; 960]);
+        assert!(!state.tts_prebuffer_satisfied);
+        assert!(
+            state.next_opus_frame().is_none(),
+            "prebuffer should hold output"
+        );
+        assert_eq!(
+            state.tts_buffer_samples(),
+            960,
+            "samples should remain in buffer"
+        );
+
+        // Push enough to cross the threshold
+        state.push_pcm(vec![123; super::TTS_PREBUFFER_SAMPLES]);
+        assert!(!state.tts_prebuffer_satisfied);
+        let frame = state
+            .next_opus_frame()
+            .expect("prebuffer satisfied, should produce frame");
+        assert!(!frame.is_empty());
+        assert!(state.tts_prebuffer_satisfied);
+    }
+
+    #[test]
+    fn tts_prebuffer_releases_short_utterance_after_stall() {
+        let mut state = AudioSendState::new().expect("audio state");
+        // Push a short utterance (under TTS_PREBUFFER_SAMPLES)
+        state.push_pcm(vec![123; 960]);
+        assert!(!state.tts_prebuffer_satisfied);
+
+        // Tick 1: first tick sees growth (0 -> 960), resets stall counter
+        assert!(state.next_opus_frame().is_none());
+        // Tick 2: no growth, stall_ticks -> 1
+        assert!(state.next_opus_frame().is_none());
+        // Tick 3: no growth, stall_ticks -> 2
+        assert!(state.next_opus_frame().is_none());
+        // Tick 4: stall_ticks reaches TTS_PREBUFFER_STALL_TICKS (3) -> gate releases
+        let frame = state
+            .next_opus_frame()
+            .expect("short utterance should play after stall timeout");
+        assert!(!frame.is_empty());
+        assert!(state.tts_prebuffer_satisfied);
     }
 
     #[test]
