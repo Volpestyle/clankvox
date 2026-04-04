@@ -1,6 +1,5 @@
 use std::collections::VecDeque;
 use std::io::{self, BufRead, Read, Write};
-use std::os::unix::process::CommandExt;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -99,30 +98,7 @@ pub(crate) struct StreamPublishPlayer {
     mode: StreamPublishPlayerMode,
 }
 
-fn kill_stream_publish_process_group(pid: u32, signal: libc::c_int) -> io::Result<()> {
-    if pid == 0 {
-        return Ok(());
-    }
-    #[allow(unsafe_code, clippy::cast_possible_wrap)]
-    let rc = unsafe { libc::killpg(pid as libc::pid_t, signal) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-fn terminate_stream_publish_child(child: &mut std::process::Child, signal: libc::c_int) {
-    if let Err(error) = kill_stream_publish_process_group(child.id(), signal) {
-        if error.kind() != io::ErrorKind::NotFound {
-            warn!(
-                pid = child.id(),
-                error = %error,
-                "failed to signal stream publish process group"
-            );
-        }
-    }
-}
+use crate::process_compat::{self, ProcessSignal};
 
 use crate::h264::find_next_start_code;
 
@@ -168,17 +144,18 @@ pub(crate) fn build_stream_publish_pipeline_command(
     url: &str,
     resolved_direct_url: bool,
 ) -> String {
-    let quoted_url = url.replace('\'', "'\\''");
+    let quoted_url = process_compat::shell_quote(url);
     let ffmpeg_tail = format!(
         "ffmpeg -nostdin -loglevel error -re -i {{input}} -an -sn -dn -vf \"scale=w={STREAM_PUBLISH_TARGET_WIDTH}:h={STREAM_PUBLISH_TARGET_HEIGHT}:force_original_aspect_ratio=decrease:flags=lanczos,pad={STREAM_PUBLISH_TARGET_WIDTH}:{STREAM_PUBLISH_TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black,fps={STREAM_PUBLISH_TARGET_FPS}\" -c:v libx264 -preset veryfast -tune zerolatency -pix_fmt yuv420p -profile:v baseline -level 3.1 -g {STREAM_PUBLISH_TARGET_FPS} -keyint_min {STREAM_PUBLISH_TARGET_FPS} -sc_threshold 0 -b:v {STREAM_PUBLISH_VIDEO_BITRATE_KBPS}k -maxrate {STREAM_PUBLISH_VIDEO_BITRATE_KBPS}k -bufsize {}k -f h264 -bsf:v h264_metadata=aud=insert pipe:1",
         STREAM_PUBLISH_VIDEO_BITRATE_KBPS * 2
     );
 
     if resolved_direct_url {
-        ffmpeg_tail.replace("{input}", &format!("'{quoted_url}'"))
+        ffmpeg_tail.replace("{input}", &quoted_url)
     } else {
+        let yt_arg = process_compat::shell_quote_arg("youtube:player_client=android");
         format!(
-            "yt-dlp --no-warnings --quiet --no-playlist --extractor-args 'youtube:player_client=android' -f \"bestvideo[ext=mp4][vcodec*=avc1]/bestvideo[vcodec*=avc1]/bestvideo/best\" -o - '{quoted_url}' | {}",
+            "yt-dlp --no-warnings --quiet --no-playlist --extractor-args {yt_arg} -f \"bestvideo[ext=mp4][vcodec*=avc1]/bestvideo[vcodec*=avc1]/bestvideo/best\" -o - {quoted_url} | {}",
             ffmpeg_tail.replace("{input}", "pipe:0")
         )
     }
@@ -189,7 +166,7 @@ pub(crate) fn build_stream_publish_visualizer_pipeline_command(
     resolved_direct_url: bool,
     visualizer_mode: &str,
 ) -> String {
-    let quoted_url = url.replace('\'', "'\\''");
+    let quoted_url = process_compat::shell_quote(url);
     let visualizer_filter = match visualizer_mode {
         "spectrum" => format!(
             "showspectrum=s={STREAM_PUBLISH_TARGET_WIDTH}x{STREAM_PUBLISH_TARGET_HEIGHT}:mode=combined:slide=scroll:color=intensity"
@@ -211,10 +188,12 @@ pub(crate) fn build_stream_publish_visualizer_pipeline_command(
     );
 
     if resolved_direct_url {
-        ffmpeg_tail.replace("{input}", &format!("'{quoted_url}'"))
+        ffmpeg_tail.replace("{input}", &quoted_url)
     } else {
+        let yt_arg = process_compat::shell_quote_arg("youtube:player_client=android");
+        let audio_arg = process_compat::shell_quote_arg("bestaudio/best");
         format!(
-            "yt-dlp --no-warnings --quiet --no-playlist --extractor-args 'youtube:player_client=android' -f 'bestaudio/best' -o - '{quoted_url}' | {}",
+            "yt-dlp --no-warnings --quiet --no-playlist --extractor-args {yt_arg} -f {audio_arg} -o - {quoted_url} | {}",
             ffmpeg_tail.replace("{input}", "pipe:0")
         )
     }
@@ -295,12 +274,11 @@ impl StreamPublishPlayer {
         let thread = std::thread::spawn(move || {
             let pipeline_command = build_stream_publish_pipeline_command(&url, resolved_direct_url);
             let pipeline_started_at = tokio::time::Instant::now();
-            let child = std::process::Command::new("sh")
-                .process_group(0)
-                .args(["-c", &pipeline_command])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn();
+            let child = {
+                let mut cmd = process_compat::shell_command(&pipeline_command);
+                cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+                cmd.spawn()
+            };
 
             let mut child = match child {
                 Ok(child) => child,
@@ -339,7 +317,7 @@ impl StreamPublishPlayer {
                 let _ = event_tx.send(StreamPublishEvent::Error(
                     "stream publish pipeline missing stdout".to_string(),
                 ));
-                terminate_stream_publish_child(&mut child, libc::SIGTERM);
+                process_compat::terminate_child(&mut child, "stream_publish");
                 let _ = child.wait();
                 if let Some(handle) = stderr_thread.take() {
                     let _ = handle.join();
@@ -405,7 +383,7 @@ impl StreamPublishPlayer {
                 }
             }
 
-            terminate_stream_publish_child(&mut child, libc::SIGTERM);
+            process_compat::terminate_child(&mut child, "stream_publish");
             let wait_result = child.wait();
             if let Some(handle) = stderr_thread.take() {
                 let _ = handle.join();
@@ -476,12 +454,11 @@ impl StreamPublishPlayer {
                 &visualizer_mode,
             );
             let pipeline_started_at = tokio::time::Instant::now();
-            let child = std::process::Command::new("sh")
-                .process_group(0)
-                .args(["-c", &pipeline_command])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn();
+            let child = {
+                let mut cmd = process_compat::shell_command(&pipeline_command);
+                cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+                cmd.spawn()
+            };
 
             let mut child = match child {
                 Ok(child) => child,
@@ -520,7 +497,7 @@ impl StreamPublishPlayer {
                 let _ = event_tx.send(StreamPublishEvent::Error(
                     "stream publish visualizer missing stdout".to_string(),
                 ));
-                terminate_stream_publish_child(&mut child, libc::SIGTERM);
+                process_compat::terminate_child(&mut child, "stream_publish");
                 let _ = child.wait();
                 if let Some(handle) = stderr_thread.take() {
                     let _ = handle.join();
@@ -586,7 +563,7 @@ impl StreamPublishPlayer {
                 }
             }
 
-            terminate_stream_publish_child(&mut child, libc::SIGTERM);
+            process_compat::terminate_child(&mut child, "stream_publish");
             let wait_result = child.wait();
             if let Some(handle) = stderr_thread.take() {
                 let _ = handle.join();
@@ -659,13 +636,11 @@ impl StreamPublishPlayer {
             let pipeline_command =
                 build_stream_publish_browser_pipeline_command(&browser_mime_type);
             let pipeline_started_at = tokio::time::Instant::now();
-            let child = std::process::Command::new("sh")
-                .process_group(0)
-                .args(["-c", &pipeline_command])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn();
+            let child = {
+                let mut cmd = process_compat::shell_command(&pipeline_command);
+                cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+                cmd.spawn()
+            };
 
             let mut child = match child {
                 Ok(child) => child,
@@ -706,7 +681,7 @@ impl StreamPublishPlayer {
                     "stream publish browser pipeline missing stdout".to_string(),
                 ));
                 *stdin_thread.lock() = None;
-                terminate_stream_publish_child(&mut child, libc::SIGTERM);
+                process_compat::terminate_child(&mut child, "stream_publish");
                 let _ = child.wait();
                 if let Some(handle) = stderr_thread.take() {
                     let _ = handle.join();
@@ -781,7 +756,7 @@ impl StreamPublishPlayer {
             }
 
             *stdin_thread.lock() = None;
-            terminate_stream_publish_child(&mut child, libc::SIGTERM);
+            process_compat::terminate_child(&mut child, "stream_publish");
             let wait_result = child.wait();
             if let Some(handle) = stderr_thread.take() {
                 let _ = handle.join();
@@ -902,7 +877,7 @@ impl StreamPublishPlayer {
         if pid == 0 {
             return false;
         }
-        match kill_stream_publish_process_group(pid, libc::SIGSTOP) {
+        match process_compat::signal_process_group(pid, ProcessSignal::Suspend) {
             Ok(()) => {
                 self.paused.store(true, Ordering::SeqCst);
                 true
@@ -924,7 +899,7 @@ impl StreamPublishPlayer {
         if pid == 0 {
             return false;
         }
-        match kill_stream_publish_process_group(pid, libc::SIGCONT) {
+        match process_compat::signal_process_group(pid, ProcessSignal::Resume) {
             Ok(()) => {
                 self.paused.store(false, Ordering::SeqCst);
                 true
@@ -949,7 +924,7 @@ impl StreamPublishPlayer {
         }
         if let Some(handle) = self.thread.take() {
             let pid = self.child_pid.load(Ordering::SeqCst);
-            if let Err(error) = kill_stream_publish_process_group(pid, libc::SIGTERM) {
+            if let Err(error) = process_compat::signal_process_group(pid, ProcessSignal::Terminate) {
                 if error.kind() != io::ErrorKind::NotFound {
                     warn!(
                         pid,

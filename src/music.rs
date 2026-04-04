@@ -1,6 +1,5 @@
 use std::collections::VecDeque;
 use std::io::{self, BufRead};
-use std::os::unix::process::CommandExt;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -97,45 +96,7 @@ pub(crate) struct MusicPlayer {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-/// Send a signal to the entire process group of a music pipeline child.
-///
-/// # Safety
-///
-/// This calls `libc::killpg` which is inherently unsafe because it sends a
-/// signal to an entire process group. The safety invariants are:
-///
-/// - `pid` must be a valid, non-zero PID obtained from `std::process::Child::id()`.
-/// - The child was spawned with `.process_group(0)` (see `MusicPlayer::start`),
-///   which places the shell pipeline (sh + yt-dlp + ffmpeg) in its own process
-///   group whose PGID equals the child PID.
-/// - Callers only use process-group signals that are valid for the music
-///   pipeline lifecycle: `SIGTERM` for shutdown plus `SIGSTOP` / `SIGCONT`
-///   for in-place pause and resume. We never send `SIGKILL`.
-/// - The guard `if pid == 0 { return; }` prevents signaling PID 0, which
-///   would signal the calling process's own group.
-fn kill_music_process_group(pid: u32, signal: libc::c_int) -> io::Result<()> {
-    if pid == 0 {
-        return Ok(());
-    }
-    // SAFETY: All invariants documented above are upheld by the caller.
-    // `pid` originates from `Child::id()`, the child uses `.process_group(0)`,
-    // and we guard against pid==0.
-    #[allow(unsafe_code, clippy::cast_possible_wrap)]
-    let rc = unsafe { libc::killpg(pid as libc::pid_t, signal) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-fn terminate_music_child(child: &mut std::process::Child, signal: libc::c_int) {
-    if let Err(error) = kill_music_process_group(child.id(), signal) {
-        if error.kind() != io::ErrorKind::NotFound {
-            warn!(pid = child.id(), error = %error, "failed to signal music process group");
-        }
-    }
-}
+use crate::process_compat::{self, ProcessSignal};
 
 impl MusicPlayer {
     #[allow(clippy::too_many_lines)]
@@ -156,12 +117,11 @@ impl MusicPlayer {
         let thread = std::thread::spawn(move || {
             let pipeline_command = build_music_pipeline_command(&url, resolved_direct_url);
             let pipeline_started_at = time::Instant::now();
-            let child = std::process::Command::new("sh")
-                .process_group(0)
-                .args(["-c", &pipeline_command])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn();
+            let child = {
+                let mut cmd = process_compat::shell_command(&pipeline_command);
+                cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+                cmd.spawn()
+            };
 
             let mut child = match child {
                 Ok(c) => c,
@@ -200,7 +160,7 @@ impl MusicPlayer {
                 let _ = music_event_tx.blocking_send(MusicEvent::Error(
                     "music pipeline missing stdout".to_string(),
                 ));
-                terminate_music_child(&mut child, libc::SIGTERM);
+            process_compat::terminate_child(&mut child, "music");
                 let _ = child.wait();
                 if let Some(handle) = stderr_thread.take() {
                     let _ = handle.join();
@@ -243,7 +203,7 @@ impl MusicPlayer {
                 }
             }
 
-            terminate_music_child(&mut child, libc::SIGTERM);
+            process_compat::terminate_child(&mut child, "music");
             let wait_result = child.wait();
             if let Some(handle) = stderr_thread.take() {
                 let _ = handle.join();
@@ -302,7 +262,7 @@ impl MusicPlayer {
         if pid == 0 {
             return false;
         }
-        match kill_music_process_group(pid, libc::SIGSTOP) {
+        match process_compat::signal_process_group(pid, ProcessSignal::Suspend) {
             Ok(()) => {
                 self.paused.store(true, Ordering::SeqCst);
                 true
@@ -325,7 +285,7 @@ impl MusicPlayer {
             self.paused.store(false, Ordering::SeqCst);
             return false;
         }
-        match kill_music_process_group(pid, libc::SIGCONT) {
+        match process_compat::signal_process_group(pid, ProcessSignal::Resume) {
             Ok(()) => {
                 self.paused.store(false, Ordering::SeqCst);
                 true
@@ -345,11 +305,11 @@ impl MusicPlayer {
         if let Some(thread) = self.thread.take() {
             if !thread.is_finished() {
                 let pid = self.child_pid.load(Ordering::SeqCst);
-                // A SIGSTOP'd process won't handle SIGTERM until continued.
+                // A suspended process won't handle termination until resumed.
                 if was_paused {
-                    let _ = kill_music_process_group(pid, libc::SIGCONT);
+                    let _ = process_compat::signal_process_group(pid, ProcessSignal::Resume);
                 }
-                if let Err(error) = kill_music_process_group(pid, libc::SIGTERM) {
+                if let Err(error) = process_compat::signal_process_group(pid, ProcessSignal::Terminate) {
                     if error.kind() != io::ErrorKind::NotFound {
                         warn!(pid, error = %error, "failed to stop music process group");
                     }
@@ -442,12 +402,13 @@ impl MusicState {
 }
 
 pub(crate) fn build_music_pipeline_command(url: &str, resolved_direct_url: bool) -> String {
-    let quoted_url = url.replace('\'', "'\\''");
+    let quoted_url = process_compat::shell_quote(url);
     if resolved_direct_url {
-        format!("ffmpeg -nostdin -loglevel error -i '{quoted_url}' -f s16le -ar 48000 -ac 1 pipe:1")
+        format!("ffmpeg -nostdin -loglevel error -i {quoted_url} -f s16le -ar 48000 -ac 1 pipe:1")
     } else {
+        let yt_arg = process_compat::shell_quote_arg("youtube:player_client=android");
         format!(
-            "yt-dlp --no-warnings --quiet --no-playlist --extractor-args 'youtube:player_client=android' -f bestaudio/best -o - '{quoted_url}' | ffmpeg -nostdin -loglevel error -i pipe:0 -f s16le -ar 48000 -ac 1 pipe:1"
+            "yt-dlp --no-warnings --quiet --no-playlist --extractor-args {yt_arg} -f bestaudio/best -o - {quoted_url} | ffmpeg -nostdin -loglevel error -i pipe:0 -f s16le -ar 48000 -ac 1 pipe:1"
         )
     }
 }

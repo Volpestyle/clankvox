@@ -12,6 +12,7 @@ mod ipc_router;
 mod media_sink_wants;
 mod music;
 mod playback_supervisor;
+mod process_compat;
 mod rtcp;
 mod rtp;
 mod stream_publish;
